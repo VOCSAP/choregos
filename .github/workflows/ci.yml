@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  plugins:
+    runs-on: ubuntu-latest
+    outputs:
+      names: ${{ steps.list.outputs.names }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: list
+        run: |
+          manifest=.claude-plugin/marketplace.json
+          invalid=$(jq -r '.plugins[].name | select(test("^[a-z0-9][a-z0-9-]{0,63}$") | not)' "$manifest")
+          if [ -n "$invalid" ]; then
+            echo "::error::plugin name must match ^[a-z0-9][a-z0-9-]{0,63}\$: $invalid"
+            exit 1
+          fi
+          misplaced=$(jq -r '.plugins[] | select(.source != "./plugins/" + .name) | .name' "$manifest")
+          if [ -n "$misplaced" ]; then
+            echo "::error::source is not ./plugins/<name> for: $misplaced"
+            exit 1
+          fi
+          declared=$(jq -c '[.plugins[].name] | sort' "$manifest")
+          folders=$(find plugins -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | jq -Rsc 'split("\n") | map(select(. != "")) | sort')
+          if [ "$declared" != "$folders" ]; then
+            echo "::error::marketplace plugins $declared differ from plugins/ folders $folders"
+            exit 1
+          fi
+          echo "names=$declared" >> "$GITHUB_OUTPUT"
+
+  plugin:
+    needs: plugins
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin: ${{ fromJSON(needs.plugins.outputs.names) }}
+    env:
+      PLUGIN: ${{ matrix.plugin }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --global @anthropic-ai/claude-code@2.1.303
+      - run: claude plugin validate "plugins/$PLUGIN"
+      - run: claude plugin test "plugins/$PLUGIN"

@@ -7,10 +7,12 @@ Choregos is a marketplace of independent Claude Code plugins.
 ```text
 /plugin marketplace add VOCSAP/choregos
 /plugin install prosopon@choregos
+/plugin install mitos@choregos
 ```
 
 ## Plugins
 
 - `prosopon` -- readable transcript layouts with a safe stock-renderer fallback.
+- `mitos` -- existing file paths in replies become clickable `file:///` links.
 
 Each plugin is installed and enabled independently.

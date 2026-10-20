@@ -12,3 +12,14 @@ Each requirement has a stable identifier and a matching `claude plugin test` cas
 - **R6** -- Layout support requires `SessionVersion.base` to be a release `MAJOR.MINOR.PATCH` at or above the minimum supported version (`2.1.303`), compared numerically component by component; an absent, `-dev`, unreadable or older version uses the stock renderer.
 - **R7** -- Any malformed layout input or rendering error uses the stock renderer. Prosopon performs no network or process access and only permits filesystem existence checks when such checks are introduced.
 - **R8** -- Prosopon creates no link of its own in M0. A link it creates may use only `http:`, `https:`, or `file:`, is at most 2048 characters, defines no plugin-specific scheme, and never executes while read.
+
+# Mitos contract
+
+Mitos rewrites a bare file path of an assistant reply into a Markdown link `[path](file:///...)` and passes the text on with `next`; it draws nothing itself. R4, R6 (capability `links`), R7 and R8 apply to Mitos as written above, with Mitos in place of Prosopon; R8 holds for every link Mitos creates. Each requirement below has a matching `claude plugin test` case.
+
+- **MT1** -- Mitos links only an existing regular file reached through no symbolic link or junction: each path component is checked on its own, the walk stops at the first link, and nothing beneath that link is checked, so no path through a link to a network share is ever opened.
+- **MT2** -- A network or device spelling (`\\`, `//`, `\\?\`, `\\.\`), a drive-relative path, an alternate data stream or a control character is never linked and never checked on disk.
+- **MT3** -- Only extensions in the `allowed_extensions` option are linked; the manifest holds the default list, and a list set by the user replaces it. `exe`, `bat`, `cmd`, `ps1`, `psm1`, `msi`, `com`, `scr`, `vbs`, `hta`, `lnk`, `url`, `sh`, `reg`, `jar`, `appref-ms`, `js`, `jse`, `vbe`, `wsf`, `wsh`, `msc`, `cpl`, `pif`, `chm`, `scf`, `settingcontent-ms`, `application` and `gadget` are never linked, whatever the option holds; a `.js` path is therefore not clickable outside Kory.
+- **MT4** -- The target is `file:///` followed by the absolute path with `/` separators, every character outside `A-Z a-z 0-9 - . _ ~ /` (and the drive colon) percent-encoded as UTF-8, and at most 2048 characters once encoded. A `:line` suffix stays in the label and never reaches the target.
+- **MT5** -- Fenced code, inline code, existing links and images, autolinks and URLs are left untouched, so a second pass changes nothing.
+- **MT6** -- At most 32 distinct paths are checked in one message; a reply over 64 KiB is passed on unchanged, and a run of non-blank characters longer than 2048 is not scanned.

@@ -9,6 +9,11 @@
       "name": "prosopon",
       "source": "./plugins/prosopon",
       "description": "Readable transcript layouts with safe fallbacks."
+    },
+    {
+      "name": "mitos",
+      "source": "./plugins/mitos",
+      "description": "Existing file paths in replies become clickable file links."
     }
   ]
 }

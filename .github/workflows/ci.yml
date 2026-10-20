@@ -34,6 +34,22 @@ jobs:
             exit 1
           fi
           echo "names=$declared" >> "$GITHUB_OUTPUT"
+      - name: versions.ts is identical in every plugin
+        run: |
+          reference=""
+          for dir in plugins/*/; do
+            file="${dir}hooks/versions.ts"
+            if [ ! -f "$file" ]; then
+              echo "::error::$file is missing"
+              exit 1
+            fi
+            if [ -z "$reference" ]; then
+              reference="$file"
+            elif ! cmp -s "$reference" "$file"; then
+              echo "::error::$file differs from $reference"
+              exit 1
+            fi
+          done
 
   plugin:
     needs: plugins

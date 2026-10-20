@@ -1,0 +1,14 @@
+{
+  "name": "choregos",
+  "description": "Independent Claude Code plugins from VOCSAP.",
+  "owner": {
+    "name": "VOCSAP"
+  },
+  "plugins": [
+    {
+      "name": "prosopon",
+      "source": "./plugins/prosopon",
+      "description": "Readable transcript layouts with safe fallbacks."
+    }
+  ]
+}

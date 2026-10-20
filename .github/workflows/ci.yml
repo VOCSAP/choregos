@@ -53,13 +53,17 @@ jobs:
 
   plugin:
     needs: plugins
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         plugin: ${{ fromJSON(needs.plugins.outputs.names) }}
     env:
       PLUGIN: ${{ matrix.plugin }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

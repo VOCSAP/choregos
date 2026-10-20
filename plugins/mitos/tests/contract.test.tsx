@@ -35,6 +35,16 @@ const DISK: Record<string, Entry> = {
 
 type World = { stats: string[]; logs: string[] }
 
+// The engine hands the hook its host's spelling of the path mitos asked for: a Windows host
+// uses backslashes and puts a rooted POSIX path on the current drive; a POSIX host does not
+// know `C:/x` as absolute and joins it under the plugin folder. Both map back to the fixture key.
+function fixtureKey(enginePath: string, disk: Record<string, Entry>): string {
+  const slashed = enginePath.replace(/\\/g, '/')
+  const driveForm = /(?:^|\/)([A-Za-z]:\/.*)$/.exec(slashed)?.[1]
+  const rootedForm = slashed.replace(/^[A-Za-z]:(?=\/)/, '')
+  return [slashed, driveForm, rootedForm].find((key) => key !== undefined && key in disk) ?? driveForm ?? slashed
+}
+
 function world(on: On, options: { version?: SessionVersion | 'reject'; cwd?: string | 'reject'; disk?: Record<string, Entry> } = {}): World {
   const { version = SUPPORTED, cwd = CWD, disk = DISK } = options
   const seen: World = { stats: [], logs: [] }
@@ -45,10 +55,9 @@ function world(on: On, options: { version?: SessionVersion | 'reject'; cwd?: str
   on('session.version', () => (version === 'reject' ? { deny: 'version unavailable' } : { value: version }))
   on('session.cwd', () => (cwd === 'reject' ? { deny: 'cwd unavailable' } : { value: cwd }))
   on('fs.stat', (_$, e) => {
-    // A Windows host hands the hook its own spelling: backslashes, and a rooted POSIX path on the current drive.
-    const path = e.path.replace(/\\/g, '/')
+    const path = fixtureKey(e.path, disk)
     seen.stats.push(path)
-    const entry = disk[path] ?? disk[path.replace(/^[A-Za-z]:(?=\/)/, '')]
+    const entry = disk[path]
     if (entry === undefined) return { deny: `failed: ENOENT` }
     return { value: { kind: entry.kind, size: 1, mtimeMs: 0, isLink: entry.isLink === true } }
   })
@@ -86,6 +95,21 @@ describe('links', () => {
   test('links a POSIX path under a POSIX session directory', async ($, on) => {
     world(on, { cwd: '/home/u', disk: { '/home/u/src': { kind: 'dir' }, '/home/u/src/a.ts': { kind: 'file' } } })
     expect(await rendered($, 'src/a.ts')).toBe('[src/a.ts](file:///home/u/src/a.ts)')
+  })
+
+  test('links a POSIX absolute path outside a POSIX session directory and stops at a link', async ($, on) => {
+    const seen = world(on, {
+      cwd: '/home/u',
+      disk: {
+        '/opt': { kind: 'dir' },
+        '/opt/notes.md': { kind: 'file' },
+        '/home/u/docs': { kind: 'other', isLink: true },
+        '/home/u/docs/x.md': { kind: 'file' },
+      },
+    })
+    expect(await rendered($, '/opt/notes.md docs/x.md')).toBe('[/opt/notes.md](file:///opt/notes.md) docs/x.md')
+    expect(seen.stats).toContain('/home/u/docs')
+    expect(seen.stats).not.toContain('/home/u/docs/x.md')
   })
 
   test('percent-encodes %, # and non-ASCII characters of the target', async ($, on) => {

@@ -194,12 +194,26 @@ describe('R5 spinner cue', () => {
 })
 
 describe('R6 version', () => {
-  const uncertified: Array<[string, SessionVersion]> = [
+  const release = (base: string): SessionVersion => ({ version: base, base })
+  const supported = ['2.1.303', '2.1.304', '2.1.1000', '2.2.0', '2.10.0', '3.0.0']
+  const unsupported: Array<[string, SessionVersion]> = [
     ['absent base', { version: '2.1.303' }],
-    ['-dev build', { version: '2.1.303-dev.20261020.t101500.sha1a2b3c4', base: '2.1.303-dev' }],
-    ['unknown release', { version: '2.1.304', base: '2.1.304' }],
+    ['-dev build', { version: '2.1.304-dev.20261020.t101500.sha1a2b3c4', base: '2.1.304-dev' }],
+    ['release below the minimum', release('2.1.302')],
+    ['shorter patch below the minimum', release('2.1.40')],
+    ['older major', release('1.99.999')],
+    ['two components', release('2.1')],
+    ['four components', release('2.1.303.1')],
+    ['leading zero', release('02.1.303')],
+    ['empty base', release('')],
   ]
-  for (const [label, version] of uncertified) {
+  for (const base of supported) {
+    test(`frames on ${base}`, async ($, on) => {
+      engineBeneath(on, release(base))
+      await expectFramed(await mountReply($, REPLY), REPLY)
+    })
+  }
+  for (const [label, version] of unsupported) {
     test(`stays stock on ${label}`, async ($, on) => {
       engineBeneath(on, version)
       await expectStock(await mountReply($, REPLY), label)

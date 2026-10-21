@@ -2,7 +2,7 @@
 
 Each requirement has a stable identifier and a matching `claude plugin test` case.
 
-**Scope.** R1, R2, R3, R5 and R8 constrain what Prosopon adds or creates around the agent's text: the frame, its ornaments and any link it builds. The agent's Markdown passes through unchanged and would render the same in Claude Code's stock renderer, so these rules do not inspect it. R4 is the exception: it reads the agent's content. In M0 the dimmed summary line (`dim`) keeps the stock renderer until L2's differential capture of the stock and plugin renders, because its indentation changes where lines wrap.
+**Scope.** R1, R2, R3, R5 and R8 constrain what Prosopon adds or creates around the agent's text: the frames, their titles, the turn rule and any link it builds. The agent's Markdown passes through unchanged and would render the same in Claude Code's stock renderer, so these rules do not inspect it. R4 is the exception: it reads the agent's content. In M0 the dimmed summary line (`dim`) keeps the stock renderer until L2's differential capture of the stock and plugin renders, because its indentation changes where lines wrap.
 
 - **R1** -- A frame added by Prosopon uses only `┌┐└┘─│`; Prosopon adds no round-corner glyph `╭╮╰╯`.
 - **R2** -- Prosopon adds no line matching the numbered picker cue `^\s*❯\s+\d+\.`.
@@ -12,6 +12,9 @@ Each requirement has a stable identifier and a matching `claude plugin test` cas
 - **R6** -- Layout support requires `SessionVersion.base` to be a release `MAJOR.MINOR.PATCH` at or above the minimum supported version (`2.1.303`), compared numerically component by component; an absent, `-dev`, unreadable or older version uses the stock renderer.
 - **R7** -- Any malformed layout input or rendering error uses the stock renderer. Prosopon performs no network or process access and only permits filesystem existence checks when such checks are introduced.
 - **R8** -- Prosopon creates no link of its own in M0. A link it creates may use only `http:`, `https:`, or `file:`, is at most 2048 characters, defines no plugin-specific scheme, and never executes while read.
+- **R9** -- Prosopon frames an assistant block around what `next(e)` resolves to and never redraws the agent's text itself, so a rewrite made by a hook above or beneath it (Mitos's links) survives whichever order the plugins load in. A summary block and a message R4 keeps stock are passed on to `next(e)` unframed.
+- **R10** -- A user message is framed only when `origin.kind` is `composer`, its text is not blank, the surface is the terminal and the width is at least 40 columns; a task notification, a peer or channel message, a bridge or SDK turn, a missing or malformed origin keeps the stock renderer. The frame title comes from a fixed table (`You` or `Vous`, chosen by the `labels` option, unknown values meaning `You`); `Claude` titles an assistant frame.
+- **R11** -- The turn rule is drawn only for a non-blank `word` and a finite, non-negative `durationMs`, outside the expanded view and when the row is not waiting on background agents. It is at most `columns - 2` code points long (no display-width measure is taken), starts with `──`, and carries no spinner glyph and no spinner-row cue.
 
 # Mitos contract
 

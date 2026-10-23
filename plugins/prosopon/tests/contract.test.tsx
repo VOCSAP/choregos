@@ -2,6 +2,9 @@ import { describe, expect, test } from 'claude-code/testing'
 import type { Engine, Mounted } from 'claude-code/testing'
 import type { On, RenderViewport, SessionVersion } from 'claude-code'
 
+import { resolveFrameConfiguration, SUPPORTED_THEME_KEYS } from '../hooks/layout'
+import { register } from '../hooks/register'
+
 const PLUGIN = 'prosopon'
 const CERTIFIED: SessionVersion = { version: '2.1.303', base: '2.1.303' }
 const REPLY = 'The build passes on all three platforms. The release checks completed without warnings, and the report includes every relevant result so the operator can review the outcome before proceeding with the next deployment step.'
@@ -549,6 +552,111 @@ describe('R10 prompt frame', () => {
   test('an unknown labels value falls back to English', { options: { labels: 'xx' } }, async ($, on) => {
     engineBeneath(on)
     await expectFramed(await mountPrompt($, PROMPT), PROMPT, 'You')
+  })
+
+  test('uses configured frame labels and colors', {
+    options: { user_label: 'Operator', user_color: 'success', assistant_color: '#1a2B3c' },
+  }, async ($, on) => {
+    engineBeneath(on)
+    const prompt = await mountPrompt($, PROMPT)
+    await expectFramed(prompt, PROMPT, 'Operator')
+    expect(borderedBoxes(await prompt.drawn())[0]?.props?.borderColor).toBe('success')
+    const reply = await mountReply($, REPLY)
+    await framedAssistant(reply, REPLY)
+    expect(borderedBoxes(await reply.drawn())[0]?.props?.borderColor).toBe('#1a2B3c')
+  })
+
+  test('sets 40-column title bounds and truncation props', {
+    options: { user_label: '界'.repeat(20) },
+  }, async ($, on) => {
+    engineBeneath(on)
+    const title = nodesOfType(await (await mountPrompt($, PROMPT, undefined, { columns: 40, rows: 24 })).drawn(), 'Box')
+      .find(node => node.props?.position === 'absolute')
+    expect(title?.props).toMatchObject({ top: 0, left: 2, right: 2 })
+    expect(nodesOfType(title, 'Text')[0]?.props).toMatchObject({ wrap: 'truncate-end' })
+  })
+
+  test('validates configured labels and colors', () => {
+    expect(resolveFrameConfiguration({
+      labels: 'fr',
+      user_label: '😀'.repeat(20),
+      user_color: 'permission',
+      assistant_color: '#1a2B3c',
+    })).toEqual({
+      userLabel: '😀'.repeat(20),
+      assistantLabel: 'Claude',
+      userColor: 'permission',
+      assistantColor: '#1a2B3c',
+    })
+    expect(resolveFrameConfiguration({ labels: 'fr' })).toMatchObject({ userLabel: 'Vous' })
+    expect(resolveFrameConfiguration({ labels: 'fr', user_label: '' })).toMatchObject({ userLabel: 'Vous' })
+    expect(resolveFrameConfiguration({
+      labels: 'fr',
+      user_label: `${'x'.repeat(20)}x`,
+      user_color: 'purple',
+      assistant_color: '#abc',
+    })).toEqual({
+      userLabel: 'Vous',
+      assistantLabel: 'Claude',
+      userColor: 'suggestion',
+      assistantColor: 'claude',
+    })
+    for (const control of [
+      0x061c, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069,
+    ]) {
+      const userLabel = `abc${String.fromCodePoint(control)}txt`
+      expect(resolveFrameConfiguration({ labels: 'fr', user_label: userLabel })).toMatchObject({ userLabel: 'Vous' })
+    }
+    for (const userLabel of [
+      `Operator${String.fromCodePoint(0x001b)}[31m`,
+      `abc${String.fromCodePoint(0xd800)}txt`,
+    ]) {
+      expect(resolveFrameConfiguration({ labels: 'fr', user_label: userLabel })).toMatchObject({ userLabel: 'Vous' })
+    }
+  })
+
+  test('accepts every supported theme key and rejects other color forms', () => {
+    for (const color of Object.keys(SUPPORTED_THEME_KEYS)) {
+      expect(resolveFrameConfiguration({ user_color: color, assistant_color: color })).toMatchObject({
+        userColor: color,
+        assistantColor: color,
+      })
+    }
+    for (const color of ['', 'purple', '#abc', '#12345g', '#1234567', ' #123456', '#123456 ']) {
+      expect(resolveFrameConfiguration({ user_color: color, assistant_color: color })).toMatchObject({
+        userColor: 'suggestion',
+        assistantColor: 'claude',
+      })
+    }
+  })
+
+  test('reads each frame option once while rendering multiple frames', async () => {
+    const optionReads = { labels: 0, userLabel: 0, userColor: 0, assistantColor: 0 }
+    const renders: Record<string, (engine: Engine, event: unknown, next: (event: unknown) => Promise<unknown>) => Promise<unknown>> = {}
+    const countedOptions = {
+      get labels() { optionReads.labels += 1; return 'fr' },
+      get user_label() { optionReads.userLabel += 1; return 'Operator' },
+      get user_color() { optionReads.userColor += 1; return 'success' },
+      get assistant_color() { optionReads.assistantColor += 1; return 'permission' },
+    }
+    const recordingOn = ((event: string, matcher: { component?: string }, handler: (engine: Engine, input: unknown, next: (event: unknown) => Promise<unknown>) => Promise<unknown>) => {
+      if (event === 'ui.render' && matcher.component) renders[matcher.component] = handler
+    }) as unknown as On
+    register(recordingOn, countedOptions as never)
+    expect(renders.UserMessage, 'user render hook registered').toBeDefined()
+    expect(renders.AssistantMessage, 'assistant render hook registered').toBeDefined()
+    const engine = {
+      session: { version: async () => CERTIFIED },
+      ui: { resolve: () => ({ Box: 'Box', Text: 'Text' }), log: () => undefined },
+    } as unknown as Engine
+    const next = async (event: unknown): Promise<unknown> => event
+    const userEvent = { surface: 'terminal', viewport: VIEWPORT, props: { text: PROMPT, origin: { kind: 'composer' } } }
+    const assistantEvent = { surface: 'terminal', viewport: VIEWPORT, props: { text: REPLY } }
+    await renders.UserMessage!(engine, userEvent, next)
+    await renders.UserMessage!(engine, userEvent, next)
+    await renders.AssistantMessage!(engine, assistantEvent, next)
+    await renders.AssistantMessage!(engine, assistantEvent, next)
+    expect(optionReads).toEqual({ labels: 1, userLabel: 1, userColor: 1, assistantColor: 1 })
   })
 
   const origins: Array<[string, unknown]> = [

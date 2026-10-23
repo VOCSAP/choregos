@@ -4,10 +4,11 @@ import type { On, RenderViewport, SessionVersion } from 'claude-code'
 
 const PLUGIN = 'prosopon'
 const CERTIFIED: SessionVersion = { version: '2.1.303', base: '2.1.303' }
-const REPLY = 'The build passes on all three platforms.'
+const REPLY = 'The build passes on all three platforms. The release checks completed without warnings, and the report includes every relevant result so the operator can review the outcome before proceeding with the next deployment step.'
 const PROMPT = 'Run the build and report.'
 const VIEWPORT: RenderViewport = { columns: 80, rows: 24 }
 const WIDTHS = [40, 80, 120]
+const NATIVE_ASSISTANT_BULLET = `${String.fromCodePoint(0x25cf)} `
 
 type Reply = Mounted<'terminal', 'AssistantMessage'>
 type Prompt = Mounted<'terminal', 'UserMessage'>
@@ -120,6 +121,23 @@ function borderedBoxes(tree: unknown): Node[] {
     if (node.type === 'Box' && node.props?.borderStyle !== undefined) boxes.push(node)
   })
   return boxes
+}
+
+function nodesOfType(tree: unknown, type: string): Node[] {
+  const nodes: Node[] = []
+  walk(tree, node => {
+    if (node.type === type) nodes.push(node)
+  })
+  return nodes
+}
+
+async function expectDimNote(ui: Reply, text: string): Promise<void> {
+  const tree = await ui.drawn()
+  expect(borderedBoxes(tree), 'short note has no frame').toHaveLength(0)
+  expect(nodesOfType(tree, 'Markdown').map(node => node.props)).toEqual([{ text, dimColor: true }])
+  const bullets = nodesOfType(tree, 'Text').filter(node => node.props?.dimColor === true).flatMap(strings)
+  expect(bullets, 'short note uses the native assistant bullet (mutant: restore markdown bullet)').toContain(NATIVE_ASSISTANT_BULLET)
+  expect(nodesOfType(tree, 'Box').some(node => node.props?.paddingLeft !== undefined), 'short note has no padding').toBe(false)
 }
 
 async function expectStock(ui: Drawn, why: string, marker = 'engine'): Promise<void> {
@@ -268,11 +286,54 @@ describe('R4 limit and quota messages', () => {
     'Usage will reset at 6pm.',
   ]
   for (const message of messages) {
-    test(`stays stock: ${message}`, async ($, on) => {
+    test(`stays stock: ${message} (mutant: classify limit vocabulary as dim)`, async ($, on) => {
       engineBeneath(on)
       await expectStock(await mountReply($, message), message)
     })
   }
+})
+
+describe('short assistant notes', () => {
+  test('renders a 160-character one-line note as dim Markdown (mutant: remove dimColor)', async ($, on) => {
+    engineBeneath(on)
+    const text = 'a'.repeat(160)
+    const reply = await mountReply($, text)
+    await expectDimNote(reply, text)
+    const added = ornaments(await reply.drawn(), undefined).added
+    expect(added).toContain(NATIVE_ASSISTANT_BULLET)
+    expect(added.some(line => line.startsWith('❯') || isSpinnerRow(line))).toBe(false)
+  })
+
+  test('frames a 161-character note (mutant: move the 160-character limit)', async ($, on) => {
+    engineBeneath(on)
+    const text = 'a'.repeat(161)
+    await framedAssistant(await mountReply($, text), text)
+  })
+
+  test('frames a two-line note (mutant: allow more than one line)', async ($, on) => {
+    engineBeneath(on)
+    const text = 'First line.\nSecond line.'
+    await framedAssistant(await mountReply($, text), text)
+  })
+
+  const adversarialNotes = [
+    'Thinking… (12s · thinking)',
+    'Thinking… ↓ 17 tokens',
+    'Thinking… · thinking)',
+    '**Thinking**… (12s · work)',
+  ] as const
+  for (const text of adversarialNotes) {
+    test(`renders ${text} dim`, async ($, on) => {
+      engineBeneath(on)
+      await expectDimNote(await mountReply($, text), text)
+    })
+  }
+
+  test('normalizes edge whitespace before classifying and rendering (mutant: render untrimmed text)', async ($, on) => {
+    engineBeneath(on)
+    const text = `  ${'a'.repeat(160)} \n`
+    await expectDimNote(await mountReply($, text), 'a'.repeat(160))
+  })
 })
 
 describe('R5 spinner cue', () => {
@@ -288,7 +349,7 @@ describe('R5 spinner cue', () => {
     }
   })
 
-  test('a summary keeps the stock render', async ($, on) => {
+  test('a summary keeps the stock render (mutant: classify isSummary as dim)', async ($, on) => {
     engineBeneath(on)
     await expectStock(await mountReply($, 'Reading the config.', { isSummary: true }), 'summary')
   })
@@ -321,6 +382,7 @@ describe('R6 version', () => {
     test(`stays stock on ${label}`, async ($, on) => {
       engineBeneath(on, version)
       await expectStock(await mountReply($, REPLY), label)
+      await expectStock(await mountReply($, 'Reading the config.'), `${label} short note`)
       await expectStock(await mountPrompt($, PROMPT), label, 'engine-user')
       await expectStock(await mountTurn($, { word: 'Baked', durationMs: 3000 }), label, 'engine-turn')
     })
@@ -367,10 +429,24 @@ describe('R7 malformed input', () => {
     expect(sinks).toEqual(['debug'])
   })
 
+  test('stays stock and logs to debug when drawing a short note throws (mutant: do not fall back to next)', async ($, on) => {
+    engineBeneath(on)
+    on('ui.resolve', async (_$, e, next) => ({
+      ...(await next(e)),
+      Markdown: function Markdown() {
+        throw new Error('markdown unavailable')
+      },
+    }))
+    const sinks = captureLogSinks(on)
+    await expectStock(await mountReply($, 'Reading the config.'), 'short note drawing threw')
+    expect(sinks).toEqual(['debug'])
+  })
+
   test('stays stock below the minimum frame width', async ($, on) => {
     engineBeneath(on)
     const narrow = { columns: 39, rows: 24 }
     await expectStock(await mountReply($, REPLY, {}, narrow), '39 columns')
+    await expectStock(await mountReply($, 'Reading the config.', {}, narrow), 'short note at 39 columns')
     await expectStock(await mountPrompt($, PROMPT, { kind: 'composer' }, narrow), '39 columns', 'engine-user')
     await expectStock(await mountTurn($, { word: 'Baked', durationMs: 3000 }, narrow), '39 columns', 'engine-turn')
   })
@@ -401,7 +477,7 @@ describe('R7 malformed input', () => {
 describe('R8 links', () => {
   test('the plugin creates no Link and passes the agent text through unchanged', async ($, on) => {
     engineBeneath(on)
-    const text = 'See [the docs](https://example.test/docs) and https://example.test/raw.'
+    const text = `${'The build report retains its plain text references. '.repeat(4)}See [the docs](https://example.test/docs) and https://example.test/raw.`
     const ui = await mountReply($, text)
     await framedAssistant(ui, text)
     expect(await ui.findAll({ type: 'Link' })).toHaveLength(0)
@@ -419,8 +495,16 @@ describe('R9 composition', () => {
   test('keeps the rewrite of a hook beneath it', async ($, on) => {
     linkifierBeneath(on)
     engineBeneath(on)
-    const ui = await mountReply($, 'See a.md now.')
-    await framedAssistant(ui, `See ${LINKED} now.`)
+    const text = `${'The documentation note is retained. '.repeat(6)}See a.md now.`
+    const ui = await mountReply($, text)
+    await framedAssistant(ui, text.replace('a.md', LINKED))
+  })
+
+  test('a short note draws its own dim Markdown without the lower rendering chain', async ($, on) => {
+    linkifierBeneath(on)
+    engineBeneath(on)
+    const text = 'See a.md now.'
+    await expectDimNote(await mountReply($, text), text)
   })
 
   test('asks the chain beneath for its drawing exactly once', async ($, on) => {
@@ -436,8 +520,9 @@ describe('R9 composition', () => {
 
   test('keeps the rewrite of a hook above it, which reaches it in the props', async ($, on) => {
     engineBeneath(on)
-    const ui = await mountReply($, `See ${LINKED} now.`)
-    await framedAssistant(ui, `See ${LINKED} now.`)
+    const text = `${'The documentation note is retained. '.repeat(6)}See ${LINKED} now.`
+    const ui = await mountReply($, text)
+    await framedAssistant(ui, text)
   })
 
   test('a summary reaches the hook beneath untouched', async ($, on) => {

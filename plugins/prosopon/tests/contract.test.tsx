@@ -16,6 +16,9 @@ const NATIVE_ASSISTANT_BULLET = `${String.fromCodePoint(0x25cf)} `
 type Reply = Mounted<'terminal', 'AssistantMessage'>
 type Prompt = Mounted<'terminal', 'UserMessage'>
 type Turn = Mounted<'terminal', 'TurnDuration'>
+type ToolUse = Mounted<'terminal', 'ToolUse'>
+type ToolResult = Mounted<'terminal', 'ToolResult'>
+type ToolGroup = Mounted<'terminal', 'ToolGroup'>
 type Drawn = Reply | Prompt | Turn
 
 type Node = { type?: unknown; props?: Record<string, unknown>; children?: unknown[] }
@@ -32,6 +35,18 @@ function engineBeneath(on: On, version: SessionVersion | 'reject' = CERTIFIED): 
   on('ui.render', { component: 'TurnDuration' }, ($, e) => {
     const { Text } = $.ui.resolve(e)
     return <Text>{`engine-turn: ${e.props.word}`}</Text>
+  })
+  on('ui.render', { component: 'ToolUse' }, ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text>{`engine-tool: ${e.props.tool}`}</Text>
+  })
+  on('ui.render', { component: 'ToolResult' }, ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text>{`engine-result: ${e.props.tool}`}</Text>
+  })
+  on('ui.render', { component: 'ToolGroup' }, ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text>{`engine-group: ${e.props.calls.length}`}</Text>
   })
   on('session.version', () =>
     version === 'reject' ? { deny: 'version unavailable' } : { value: version },
@@ -100,6 +115,48 @@ function mountTurn(
     props: props as never,
     viewport,
   })
+}
+
+function mountTool(
+  $: Engine,
+  props: Record<string, unknown>,
+  viewport: RenderViewport = VIEWPORT,
+): Promise<ToolUse> {
+  return $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'ToolUse',
+    props: {
+      tool_use_id: 'toolu_contract',
+      tool: 'Bash',
+      input: { command: 'echo contract' },
+      isRunning: false,
+      isErrored: false,
+      isInterrupted: false,
+      ...props,
+    } as never,
+    viewport,
+  }) as Promise<ToolUse>
+}
+
+function mountToolResult($: Engine): Promise<ToolResult> {
+  return $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'ToolResult',
+    props: { tool_use_id: 'toolu_contract', tool: 'Bash', output: { stdout: 'native result' }, isErrored: false },
+    viewport: VIEWPORT,
+  } as never) as Promise<ToolResult>
+}
+
+function mountToolGroup($: Engine): Promise<ToolGroup> {
+  return $.ui.mount({
+    plugin: PLUGIN,
+    surface: 'terminal',
+    component: 'ToolGroup',
+    props: { calls: [], isActive: false, isExpanded: false, isCallsOnly: false },
+    viewport: VIEWPORT,
+  } as never) as Promise<ToolGroup>
 }
 
 function walk(tree: unknown, visit: (node: Node) => void): void {
@@ -673,6 +730,213 @@ describe('R10 prompt frame', () => {
       await expectStock(await mountPrompt($, PROMPT, origin), label, 'engine-user')
     })
   }
+})
+
+describe('R12 tool headers', () => {
+  test('redraws a closed Bash header with a native green bullet and dim detail', async ($, on) => {
+    engineBeneath(on)
+    const tree = await (await mountTool($, { input: { command: 'echo contract' } })).drawn()
+    expect(strings(tree), 'Bash header').toContain('● ')
+    const bullet = nodesOfType(tree, 'Text').find(node => strings(node).includes('● '))
+    expect(bullet?.props, 'native green Bash bullet (mutant: gray bullet)').toMatchObject({ color: 'success' })
+    expect(strings(tree).join(''), 'Bash detail').toContain('Bash(echo contract)')
+    const detail = nodesOfType(tree, 'Text').find(node => node.props?.dimColor === true)
+    expect(detail?.props, 'dim Bash detail').toMatchObject({ dimColor: true })
+  })
+
+  test('keeps the native blank row above a redrawn Bash header', async ($, on) => {
+    engineBeneath(on)
+    const header = nodesOfType(await (await mountTool($, { input: { command: 'echo contract' } })).drawn(), 'Box').find(
+      node => node.props?.marginTop === 1,
+    )
+    expect(header?.props, 'native blank row for Bash').toMatchObject({ marginTop: 1 })
+  })
+
+  test('delegates file tools for bare and nested absolute paths', async () => {
+    const renders: Record<string, (engine: Engine, event: unknown, next: (event: unknown) => Promise<unknown>) => Promise<unknown>> = {}
+    const recordingOn = ((event: string, matcher: { component?: string }, handler: (engine: Engine, input: unknown, next: (event: unknown) => Promise<unknown>) => Promise<unknown>) => {
+      if (event === 'ui.render' && matcher.component) renders[matcher.component] = handler
+    }) as unknown as On
+    register(recordingOn, {} as never)
+    const engine = {
+      session: { version: async () => CERTIFIED },
+      ui: { resolve: () => ({ Box: 'Box', Text: 'Text' }), log: () => undefined },
+    } as unknown as Engine
+    const delegated: unknown[] = []
+    const next = async (event: unknown): Promise<unknown> => {
+      delegated.push(event)
+      return event
+    }
+    for (const tool of ['Edit', 'Write', 'Update']) {
+      for (const file_path of ['C:/work/file.txt', 'C:/work/src/sub/file.txt']) {
+        const event = {
+          surface: 'terminal',
+          viewport: VIEWPORT,
+          props: { tool, input: { file_path }, isRunning: false, isErrored: false, isInterrupted: false },
+        }
+        await renders.ToolUse!(engine, event, next)
+        expect(delegated.at(-1), `${tool} ${file_path} reaches next`).toBe(event)
+      }
+    }
+    expect(delegated, 'every file tool path reaches next exactly once').toHaveLength(6)
+  })
+
+  test('indents Bash header continuations by six columns', async ($, on) => {
+    engineBeneath(on)
+    const ui = await mountTool($, { input: { command: 'echo one two three four five six seven eight nine ten' } }, { columns: 40, rows: 24 })
+    const continuation = nodesOfType(await ui.drawn(), 'Box').find(node => node.props?.paddingLeft !== undefined)
+    expect(continuation?.props, 'Bash continuation (mutant: indent at 2)').toMatchObject({ paddingLeft: 6 })
+  })
+
+  test('reserves the bullet width before wrapping Bash at 80 columns', async ($, on) => {
+    engineBeneath(on)
+    const command = 'echo alpha > tool-header-filename-that-wraps-natively-at-forty-columns.txt'
+    const ui = await mountTool($, { input: { command } }, { columns: 80, rows: 24 })
+    const continuation = nodesOfType(await ui.drawn(), 'Box').find(node => node.props?.paddingLeft !== undefined)
+    expect(continuation?.props, 'Bash continuation after its bullet').toMatchObject({ paddingLeft: 6 })
+  })
+
+  test('keeps unsupported tools and non-closed states native', async ($, on) => {
+    engineBeneath(on)
+    for (const props of [
+      { tool: 'Read', input: { file_path: 'C:/work/read.txt' } },
+      { isRunning: true },
+      { isErrored: true },
+      { isInterrupted: true },
+      { isExpanded: true },
+      { isRunning: true, isErrored: true },
+    ]) {
+      expect(strings(await (await mountTool($, props)).drawn()), `native ToolUse ${JSON.stringify(props)}`).toContain(
+        `engine-tool: ${props.tool ?? 'Bash'}`,
+      )
+    }
+  })
+
+  test('delegates an expanded tool before reading the viewport width', async () => {
+    const renders: Record<string, (engine: Engine, event: unknown, next: (event: unknown) => Promise<unknown>) => Promise<unknown>> = {}
+    const recordingOn = ((event: string, matcher: { component?: string }, handler: (engine: Engine, input: unknown, next: (event: unknown) => Promise<unknown>) => Promise<unknown>) => {
+      if (event === 'ui.render' && matcher.component) renders[matcher.component] = handler
+    }) as unknown as On
+    register(recordingOn, {} as never)
+    const engine = {
+      session: { version: async () => CERTIFIED },
+      ui: { resolve: () => ({ Box: 'Box', Text: 'Text' }), log: () => undefined },
+    } as unknown as Engine
+    const event = {
+      surface: 'terminal',
+      viewport: { get columns(): never { throw new Error('viewport read') }, rows: 24 },
+      props: { tool: 'Bash', input: { command: 'echo contract' }, isRunning: false, isErrored: false, isInterrupted: false, isExpanded: true },
+    }
+    let nextCalls = 0
+    await renders.ToolUse!(engine, event, async input => {
+      nextCalls += 1
+      return input
+    })
+    expect(nextCalls, 'expanded ToolUse reaches next before reading width').toBe(1)
+  })
+
+  test('keeps unsafe arguments and near-miss tool names native', async ($, on) => {
+    engineBeneath(on)
+    for (const tool of ['bash', 'BashExtra', 'mcp__Bash']) {
+      expect(strings(await (await mountTool($, { tool })).drawn()), `native tool ${tool}`).toContain(`engine-tool: ${tool}`)
+    }
+    const unsafeArguments: Array<[string, string]> = [
+      ['empty', ''],
+      ['quota row', "\n⎿ You've hit your limit"],
+      ['escape', '\u001b'],
+      ['isolated surrogate', '\ud800'],
+      ['bidi control', '\u202e'],
+      ['CJK', '漢'],
+      ['emoji', '🙂'],
+    ]
+    for (const [label, value] of unsafeArguments) {
+      expect(strings(await (await mountTool($, { input: { command: value } })).drawn()), `native Bash ${label}`).toContain(
+        'engine-tool: Bash',
+      )
+    }
+  })
+
+  test('delegates Bash words that need a mid-word wrap', async () => {
+    const renders: Record<string, (engine: Engine, event: unknown, next: (event: unknown) => Promise<unknown>) => Promise<unknown>> = {}
+    const recordingOn = ((event: string, matcher: { component?: string }, handler: (engine: Engine, input: unknown, next: (event: unknown) => Promise<unknown>) => Promise<unknown>) => {
+      if (event === 'ui.render' && matcher.component) renders[matcher.component] = handler
+    }) as unknown as On
+    register(recordingOn, {} as never)
+    const engine = {
+      session: { version: async () => CERTIFIED },
+      ui: { resolve: () => ({ Box: 'Box', Text: 'Text' }), log: () => undefined },
+    } as unknown as Engine
+    let nextCalls = 0
+    for (const [columns, length] of [[80, 100], [120, 150]] as Array<[number, number]>) {
+      const event = {
+        surface: 'terminal',
+        viewport: { columns, rows: 24 },
+        props: { tool: 'Bash', input: { command: `echo ${'a'.repeat(length)}` }, isRunning: false, isErrored: false, isInterrupted: false },
+      }
+      await renders.ToolUse!(engine, event, async input => {
+        nextCalls += 1
+        return input
+      })
+    }
+    expect(nextCalls, 'Bash words requiring a mid-word wrap reach next').toBe(2)
+  })
+
+  test('delegates Bash commands over 300 UTF-16 code units before a third command read', async () => {
+    const renders: Record<string, (engine: Engine, event: unknown, next: (event: unknown) => Promise<unknown>) => Promise<unknown>> = {}
+    const recordingOn = ((event: string, matcher: { component?: string }, handler: (engine: Engine, input: unknown, next: (event: unknown) => Promise<unknown>) => Promise<unknown>) => {
+      if (event === 'ui.render' && matcher.component) renders[matcher.component] = handler
+    }) as unknown as On
+    register(recordingOn, {} as never)
+    const engine = {
+      session: { version: async () => CERTIFIED },
+      ui: { resolve: () => ({ Box: 'Box', Text: 'Text' }), log: () => undefined },
+    } as unknown as Engine
+    let reads = 0
+    const input = Object.defineProperty({}, 'command', {
+      get(): string {
+        reads += 1
+        if (reads > 2) throw new Error('command read after length bound')
+        return `echo ${'a'.repeat(301)}`
+      },
+    })
+    let nextCalls = 0
+    const event = {
+      surface: 'terminal',
+      viewport: { columns: 120, rows: 24 },
+      props: { tool: 'Bash', input, isRunning: false, isErrored: false, isInterrupted: false },
+    }
+    await renders.ToolUse!(engine, event, async input => {
+      nextCalls += 1
+      return input
+    })
+    expect(nextCalls, 'Bash command over 300 UTF-16 code units reaches next once').toBe(1)
+    expect(reads, 'Bash command was read only through its length bound').toBe(2)
+  })
+
+  test('keeps five Bash header rows custom and delegates six', async ($, on) => {
+    engineBeneath(on)
+    const fiveRows = `echo ${'aaaaaaaaaa '.repeat(13).trimEnd()}`
+    expect(
+      strings(await (await mountTool($, { input: { command: fiveRows } }, { columns: 40, rows: 24 })).drawn()).join('\n'),
+      'five-row Bash header',
+    ).toContain('Bash(echo')
+    const sixRows = `echo ${'aaaaaaaaaa '.repeat(16).trimEnd()}`
+    expect(
+      strings(await (await mountTool($, { input: { command: sixRows } }, { columns: 40, rows: 24 })).drawn()),
+      'six-row Bash header',
+    ).toContain('engine-tool: Bash')
+  })
+
+  test('redraws a closed tool with isExpanded absent', async ($, on) => {
+    engineBeneath(on)
+    expect(strings(await (await mountTool($, { isExpanded: undefined })).drawn())).toContain('Bash(echo contract)')
+  })
+
+  test('keeps tool results, diffs, and groups native', async ($, on) => {
+    engineBeneath(on)
+    expect(strings(await (await mountToolResult($)).drawn())).toContain('engine-result: Bash')
+    expect(strings(await (await mountToolGroup($)).drawn())).toContain('engine-group: 0')
+  })
 })
 
 describe('R11 turn rule', () => {

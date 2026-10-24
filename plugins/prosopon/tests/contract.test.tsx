@@ -2,7 +2,7 @@ import { describe, expect, test } from 'claude-code/testing'
 import type { Engine, Mounted } from 'claude-code/testing'
 import type { On, RenderViewport, SessionVersion } from 'claude-code'
 
-import { isRenderableText, resolveFrameConfiguration, SUPPORTED_THEME_KEYS } from '../hooks/layout'
+import { isRenderableText, NAMED_COLORS, resolveFrameConfiguration, SUPPORTED_THEME_KEYS } from '../hooks/layout'
 import { register } from '../hooks/register'
 
 const PLUGIN = 'prosopon'
@@ -742,7 +742,7 @@ describe('R10 prompt frame', () => {
     expect(resolveFrameConfiguration({
       labels: 'fr',
       user_label: `${'x'.repeat(20)}x`,
-      user_color: 'purple',
+      user_color: 'chartreuse',
       assistant_color: '#abc',
     })).toEqual({
       userLabel: 'Vous',
@@ -771,12 +771,38 @@ describe('R10 prompt frame', () => {
         assistantColor: color,
       })
     }
-    for (const color of ['', 'purple', '#abc', '#12345g', '#1234567', ' #123456', '#123456 ']) {
+    for (const color of [
+      '', 'chartreuse', ' red', 'red ', 'Success', 'constructor', '__proto__', 'toString',
+      '#abc', '#12345g', '#1234567', ' #123456', '#123456 ',
+    ]) {
       expect(resolveFrameConfiguration({ user_color: color, assistant_color: color })).toMatchObject({
         userColor: 'suggestion',
         assistantColor: 'claude',
       })
     }
+  })
+
+  const COLOR_NAMES = ['red', 'orange', 'yellow', 'green', 'cyan', 'blue', 'purple', 'magenta', 'pink', 'gray', 'grey', 'white', 'black']
+
+  test('resolves an English color name in any case to its hex value (mutant: drop the name table)', () => {
+    expect(Object.keys(NAMED_COLORS).sort()).toEqual([...COLOR_NAMES].sort())
+    for (const name of COLOR_NAMES) {
+      const hex = NAMED_COLORS[name as keyof typeof NAMED_COLORS]
+      expect(hex, `${name} is a #rrggbb`).toMatch(/^#[0-9a-f]{6}$/)
+      for (const spelled of [name, name.toUpperCase(), `${name[0]!.toUpperCase()}${name.slice(1)}`]) {
+        expect(resolveFrameConfiguration({ user_color: spelled, assistant_color: spelled }), spelled).toMatchObject({
+          userColor: hex,
+          assistantColor: hex,
+        })
+      }
+    }
+    expect(NAMED_COLORS.gray).toBe(NAMED_COLORS.grey)
+  })
+
+  test('draws a frame in a named color', { options: { user_color: 'Blue', assistant_color: 'orange' } }, async ($, on) => {
+    engineBeneath(on)
+    expect(borderedBoxes(await (await mountPrompt($, PROMPT)).drawn())[0]?.props?.borderColor).toBe(NAMED_COLORS.blue)
+    expect(borderedBoxes(await (await mountReply($, REPLY)).drawn())[0]?.props?.borderColor).toBe(NAMED_COLORS.orange)
   })
 
   test('reads each frame option once while rendering multiple frames', async () => {

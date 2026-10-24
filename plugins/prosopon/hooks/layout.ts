@@ -56,9 +56,20 @@ function resolveUserLabel(value: unknown, fallback: string): string {
   return value
 }
 
+// Mid shades, so a frame stays visible on a dark or a light terminal; white and black do what they say.
+export const NAMED_COLORS = {
+  red: '#ef4444', orange: '#f97316', yellow: '#eab308', green: '#22c55e', cyan: '#06b6d4', blue: '#3b82f6',
+  purple: '#a855f7', magenta: '#d946ef', pink: '#ec4899', gray: '#6b7280', grey: '#6b7280', white: '#ffffff',
+  black: '#000000',
+} as const
+
+// A Map, so a name such as constructor or __proto__ never reaches the object prototype.
+const NAMED_COLOR_VALUES = new Map<string, string>(Object.entries(NAMED_COLORS))
+
 function resolveColor(value: unknown, fallback: string): string {
   if (typeof value !== 'string') return fallback
-  return THEME_KEYS.has(value) || /^#[0-9a-fA-F]{6}$/.test(value) ? value : fallback
+  if (THEME_KEYS.has(value) || /^#[0-9a-fA-F]{6}$/.test(value)) return value
+  return NAMED_COLOR_VALUES.get(value.toLowerCase()) ?? fallback
 }
 
 export function resolveFrameConfiguration(options: FrameOptions): FrameConfiguration {

@@ -23,7 +23,10 @@ type Drawn = Reply | Prompt | Turn
 
 type Node = { type?: unknown; props?: Record<string, unknown>; children?: unknown[] }
 
-function engineBeneath(on: On, version: SessionVersion | 'reject' = CERTIFIED): void {
+const SESSION_CWD = 'C:\\work'
+
+function engineBeneath(on: On, version: SessionVersion | 'reject' = CERTIFIED, cwd: string | 'reject' = SESSION_CWD): void {
+  on('session.cwd', () => (cwd === 'reject' ? { deny: 'cwd unavailable' } : { value: cwd }))
   on('ui.render', { component: 'AssistantMessage' }, ($, e) => {
     const { Text } = $.ui.resolve(e)
     return <Text>{`engine: ${e.props.text}`}</Text>
@@ -841,33 +844,62 @@ describe('R12 tool headers', () => {
     expect(header?.props, 'native blank row for Bash').toMatchObject({ marginTop: 1 })
   })
 
-  test('delegates file tools for bare and nested absolute paths', async () => {
-    const renders: Record<string, (engine: Engine, event: unknown, next: (event: unknown) => Promise<unknown>) => Promise<unknown>> = {}
-    const recordingOn = ((event: string, matcher: { component?: string }, handler: (engine: Engine, input: unknown, next: (event: unknown) => Promise<unknown>) => Promise<unknown>) => {
-      if (event === 'ui.render' && matcher.component) renders[matcher.component] = handler
-    }) as unknown as On
-    register(recordingOn, {} as never)
-    const engine = {
-      session: { version: async () => CERTIFIED },
-      ui: { resolve: () => ({ Box: 'Box', Text: 'Text' }), log: () => undefined },
-    } as unknown as Engine
-    const delegated: unknown[] = []
-    const next = async (event: unknown): Promise<unknown> => {
-      delegated.push(event)
-      return event
+  const fileHeader = async ($: Engine, tool: string, file_path: string, viewport = VIEWPORT): Promise<string[]> =>
+    strings(await (await mountTool($, { tool, input: { file_path } }, viewport)).drawn())
+
+  test('redraws a closed Edit or Write header with the path relative to the session directory', async ($, on) => {
+    engineBeneath(on)
+    const cases: Array<[string, string, string]> = [
+      ['Edit', 'C:/work/root.txt', 'Update(root.txt)'],
+      ['Write', 'C:/work/root.txt', 'Write(root.txt)'],
+      ['Edit', 'C:/work/src/sub/foo.txt', 'Update(src\\sub\\foo.txt)'],
+      ['Write', 'C:\\work\\back\\slash.txt', 'Write(back\\slash.txt)'],
+      ['Write', `C:/work/${'b'.repeat(36)}.txt`, `Write(${'b'.repeat(36)}.txt)`],
+    ]
+    for (const [tool, filePath, header] of cases) {
+      const tree = await (await mountTool($, { tool, input: { file_path: filePath } })).drawn()
+      expect(strings(tree).join(''), `${tool} ${filePath} (mutant: map Edit to Edit, or drop the separator rewrite)`).toContain(header)
+      const bullet = nodesOfType(tree, 'Text').find(node => strings(node).includes('● '))
+      expect(bullet?.props, `${tool} green bullet`).toMatchObject({ color: 'success' })
+      const detail = nodesOfType(tree, 'Text').find(node => strings(node).includes(header))
+      expect(detail?.props, `${tool} dim detail`).toMatchObject({ dimColor: true })
+      expect(nodesOfType(tree, 'Box').find(node => node.props?.marginTop === 1), `${tool} native blank row`).toBeDefined()
     }
-    for (const tool of ['Edit', 'Write', 'Update']) {
-      for (const file_path of ['C:/work/file.txt', 'C:/work/src/sub/file.txt']) {
-        const event = {
-          surface: 'terminal',
-          viewport: VIEWPORT,
-          props: { tool, input: { file_path }, isRunning: false, isErrored: false, isInterrupted: false },
-        }
-        await renders.ToolUse!(engine, event, next)
-        expect(delegated.at(-1), `${tool} ${file_path} reaches next`).toBe(event)
-      }
+  })
+
+  test('keeps the forward slash of a POSIX session directory', async ($, on) => {
+    engineBeneath(on, CERTIFIED, '/home/user/proj/')
+    expect((await fileHeader($, 'Write', '/home/user/proj/src/a.txt')).join('')).toContain('Write(src/a.txt)')
+  })
+
+  test('delegates an Edit or Write header the native renderer shows another way', async ($, on) => {
+    engineBeneath(on)
+    const delegated: Array<[string, string, string]> = [
+      ['outside the session directory', 'Edit', 'C:/other/a.txt'],
+      ['in a sibling sharing its prefix', 'Write', 'C:/work2/a.txt'],
+      ['the session directory itself', 'Write', 'C:/work'],
+      ['a parent segment', 'Write', 'C:/work/src/../a.txt'],
+      ['a current segment', 'Write', 'C:/work/./a.txt'],
+      ['an empty segment', 'Write', 'C:/work//a.txt'],
+      ['a drive letter cased differently', 'Write', 'c:/work/a.txt'],
+      ['a 41-character relative path', 'Write', `C:/work/${'c'.repeat(37)}.txt`],
+      ['a non-ASCII path', 'Write', 'C:/work/é.txt'],
+      ['a control character', 'Write', 'C:/work/a\u001b.txt'],
+      ['the Update tool name', 'Update', 'C:/work/a.txt'],
+    ]
+    for (const [label, tool, filePath] of delegated) {
+      expect(await fileHeader($, tool, filePath), `${label} (mutant: drop the under-directory, segment or 40-character check)`).toContain(`engine-tool: ${tool}`)
     }
-    expect(delegated, 'every file tool path reaches next exactly once').toHaveLength(6)
+    const narrow = { columns: 40, rows: 24 }
+    expect(await fileHeader($, 'Write', `C:/work/${'d'.repeat(27)}.txt`, narrow), 'one row at 40 columns').toContain(`Write(${'d'.repeat(27)}.txt)`)
+    expect(await fileHeader($, 'Write', `C:/work/${'d'.repeat(28)}.txt`, narrow), 'two rows at 40 columns (mutant: drop the one-row check)').toContain('engine-tool: Write')
+  })
+
+  test('delegates a file tool header and logs to debug when session.cwd rejects', async ($, on) => {
+    engineBeneath(on, CERTIFIED, 'reject')
+    const sinks = captureLogSinks(on)
+    expect(await fileHeader($, 'Edit', 'C:/work/a.txt')).toContain('engine-tool: Edit')
+    expect(sinks).toEqual(['debug'])
   })
 
   test('indents Bash header continuations by six columns', async ($, on) => {

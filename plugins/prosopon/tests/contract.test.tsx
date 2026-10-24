@@ -433,16 +433,25 @@ describe('short assistant notes', () => {
 
   // Called directly: a mounted tree the harness refuses is skipped and redrawn by the engine, which
   // reads as a native render even when the plugin returned the refused tree.
-  test('a short note holding a refused character delegates to the native render (mutant: drop the renderable-text guard)', async () => {
+  // trim() removes a leading or trailing VT or FF, so the edges are where a guard on trimmed text misses.
+  const placed = (character: string): Array<[string, string]> => [
+    ['inside', `Build ${character} done.`],
+    ['first', `${character}Build done.`],
+    ['last', `Build done.${character}`],
+  ]
+
+  test('a short note holding a refused character delegates to the native render (mutant: drop the renderable-text guard, or guard the trimmed text)', async () => {
     const renders = recordRenderHooks()
     for (const [label, character] of refusedCharacters) {
-      const event = { surface: 'terminal', viewport: VIEWPORT, props: { text: `Build ${character} done.` } }
-      const delegated: unknown[] = []
-      await renders.AssistantMessage!(RECORDING_ENGINE, event, async input => {
-        delegated.push(input)
-        return input
-      })
-      expect(delegated, `${label} reaches next unchanged`).toEqual([event])
+      for (const [where, text] of placed(character)) {
+        const event = { surface: 'terminal', viewport: VIEWPORT, props: { text } }
+        const delegated: unknown[] = []
+        await renders.AssistantMessage!(RECORDING_ENGINE, event, async input => {
+          delegated.push(input)
+          return input
+        })
+        expect(delegated, `${label} ${where} reaches next unchanged`).toEqual([event])
+      }
     }
   })
 
@@ -674,9 +683,10 @@ describe('R10 prompt frame', () => {
     await expectFramed(await mountPrompt($, `  ${PROMPT}\n`), PROMPT, 'You')
   })
 
-  test('a prompt holding a refused character delegates to the native render (mutant: drop the renderable-text guard)', async () => {
+  test('a prompt holding a refused character delegates to the native render (mutant: drop the renderable-text guard, or guard the trimmed text)', async () => {
     const renders = recordRenderHooks()
-    for (const prompt of ['Run \u001b[31m the build.', 'Run \u0007 the build.', 'Run \ud800 the build.']) {
+    const edges = ['\u000b', '\u000c', '\u001b'].flatMap(character => [`${character}Run the build.`, `Run the build.${character}`])
+    for (const prompt of ['Run \u001b[31m the build.', 'Run \u0007 the build.', 'Run \ud800 the build.', ...edges]) {
       const event = { surface: 'terminal', viewport: VIEWPORT, props: { text: prompt, origin: { kind: 'composer' } } }
       const delegated: unknown[] = []
       await renders.UserMessage!(RECORDING_ENGINE, event, async input => {

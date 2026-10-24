@@ -2,7 +2,7 @@ import { describe, expect, test } from 'claude-code/testing'
 import type { Engine, Mounted } from 'claude-code/testing'
 import type { On, RenderViewport, SessionVersion } from 'claude-code'
 
-import { resolveFrameConfiguration, SUPPORTED_THEME_KEYS } from '../hooks/layout'
+import { isRenderableText, resolveFrameConfiguration, SUPPORTED_THEME_KEYS } from '../hooks/layout'
 import { register } from '../hooks/register'
 
 const PLUGIN = 'prosopon'
@@ -52,6 +52,22 @@ function engineBeneath(on: On, version: SessionVersion | 'reject' = CERTIFIED): 
     version === 'reject' ? { deny: 'version unavailable' } : { value: version },
   )
 }
+
+type RenderHook = (engine: Engine, event: unknown, next: (event: unknown) => Promise<unknown>) => Promise<unknown>
+
+function recordRenderHooks(): Record<string, RenderHook> {
+  const renders: Record<string, RenderHook> = {}
+  const recordingOn = ((event: string, matcher: { component?: string }, handler: RenderHook) => {
+    if (event === 'ui.render' && matcher.component) renders[matcher.component] = handler
+  }) as unknown as On
+  register(recordingOn, {} as never)
+  return renders
+}
+
+const RECORDING_ENGINE = {
+  session: { version: async () => CERTIFIED },
+  ui: { resolve: () => ({ Box: 'Box', Markdown: 'Markdown', Text: 'Text' }), log: () => undefined },
+} as unknown as Engine
 
 // A hook that sits between Prosopon and the engine and rewrites the text, as Mitos does.
 function linkifierBeneath(on: On): void {
@@ -389,6 +405,61 @@ describe('short assistant notes', () => {
     })
   }
 
+  const refusedCharacters: Array<[string, string]> = [
+    ['ESC', '\u001b[31m'],
+    ['BEL', '\u0007'],
+    ['BS', '\u0008'],
+    ['VT', '\u000b'],
+    ['FF', '\u000c'],
+    ['DEL', '\u007f'],
+    ['C1 NEL', '\u0085'],
+    ['NUL', '\u0000'],
+    ['isolated surrogate', '\ud800'],
+    ['U+10EEEE', String.fromCodePoint(0x10eeee)],
+    ['U+2800 with a combining mark', '⠀̅'],
+  ]
+  const keptCharacters: Array<[string, string]> = [
+    ['TAB', '\t'],
+    ['CR', '\r'],
+    ['NBSP', ' '],
+    ['ZWJ', '‍'],
+    ['U+2028', ' '],
+    ['emoji', '🙂'],
+    ['bare U+2800', '⠀'],
+  ]
+
+  // Called directly: a mounted tree the harness refuses is skipped and redrawn by the engine, which
+  // reads as a native render even when the plugin returned the refused tree.
+  test('a short note holding a refused character delegates to the native render (mutant: drop the renderable-text guard)', async () => {
+    const renders = recordRenderHooks()
+    for (const [label, character] of refusedCharacters) {
+      const event = { surface: 'terminal', viewport: VIEWPORT, props: { text: `Build ${character} done.` } }
+      const delegated: unknown[] = []
+      await renders.AssistantMessage!(RECORDING_ENGINE, event, async input => {
+        delegated.push(input)
+        return input
+      })
+      expect(delegated, `${label} reaches next unchanged`).toEqual([event])
+    }
+  })
+
+  for (const [label, character] of keptCharacters) {
+    test(`a short note holding ${label} stays dim`, async ($, on) => {
+      engineBeneath(on)
+      const text = `Build ${character} done.`
+      await expectDimNote(await mountReply($, text), text)
+    })
+  }
+
+  test('isRenderableText follows the engine check on Text and Markdown strings', () => {
+    for (const [label, character] of refusedCharacters) {
+      expect(isRenderableText(`a${character}b`), `${label} refused`).toBe(false)
+    }
+    for (const [label, character] of [...keptCharacters, ['LF', '\n'] as [string, string]]) {
+      expect(isRenderableText(`a${character}b`), `${label} kept`).toBe(true)
+    }
+  })
+
   test('normalizes edge whitespace before classifying and rendering (mutant: render untrimmed text)', async ($, on) => {
     engineBeneath(on)
     const text = `  ${'a'.repeat(160)} \n`
@@ -598,6 +669,24 @@ describe('R10 prompt frame', () => {
   test('frames a prompt typed at the composer under its label', async ($, on) => {
     engineBeneath(on)
     await expectFramed(await mountPrompt($, `  ${PROMPT}\n`), PROMPT, 'You')
+  })
+
+  test('a prompt holding a refused character delegates to the native render (mutant: drop the renderable-text guard)', async () => {
+    const renders = recordRenderHooks()
+    for (const prompt of ['Run \u001b[31m the build.', 'Run \u0007 the build.', 'Run \ud800 the build.']) {
+      const event = { surface: 'terminal', viewport: VIEWPORT, props: { text: prompt, origin: { kind: 'composer' } } }
+      const delegated: unknown[] = []
+      await renders.UserMessage!(RECORDING_ENGINE, event, async input => {
+        delegated.push(input)
+        return input
+      })
+      expect(delegated, `${JSON.stringify(prompt)} reaches next unchanged`).toEqual([event])
+    }
+  })
+
+  test('a prompt holding a tab stays framed', async ($, on) => {
+    engineBeneath(on)
+    await expectFramed(await mountPrompt($, 'Run\tthe build.'), 'Run\tthe build.', 'You')
   })
 
   test('uses French labels when asked', { options: { labels: 'fr' } }, async ($, on) => {

@@ -71,6 +71,16 @@ export function resolveFrameConfiguration(options: FrameOptions): FrameConfigura
   }
 }
 
+// The engine checks a Text or Markdown string after the hook has returned, beyond its try/catch.
+// Stripping a refused character would leave the rest of an escape sequence visible, so the caller
+// falls back to the native render instead. Any combining mark after U+2800 is refused, a superset
+// of the terminal graphics placeholder form.
+const UNRENDERABLE_CHARACTER = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff\u{10eeee}]|⠀\p{M}/u
+
+export function isRenderableText(text: string): boolean {
+  return !UNRENDERABLE_CHARACTER.test(text)
+}
+
 // Over-matching only leaves a short message unframed; under-matching splits a
 // limit message across frame rows, which the quota detector cannot read across.
 const STOCK_VOCABULARY = /limit|reset|quota|overloaded|usage/i

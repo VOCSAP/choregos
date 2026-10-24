@@ -3,6 +3,7 @@ import type { EngineInterface, Register, RenderViewport } from 'claude-code'
 import {
   classifyAssistantBlock,
   GUARD_SAFE_BORDER,
+  isRenderableText,
   MIN_FRAME_COLUMNS,
   resolveFrameConfiguration,
   SHORT_NOTE_BULLET,
@@ -153,6 +154,7 @@ export const register: Register = (on, options) => {
       e.surface !== 'terminal' ||
       typeof text !== 'string' ||
       text.trim() === '' ||
+      !isRenderableText(text.trim()) ||
       (origin as { kind?: unknown } | null | undefined)?.kind !== 'composer' ||
       !wideEnough(e)
     ) {
@@ -203,7 +205,7 @@ export const register: Register = (on, options) => {
     if (!(await layoutSupported($))) return next(e)
     const normalized = text.trim()
     const block = classifyAssistantBlock(normalized, isSummary === true)
-    if (block === 'stock') return next(e)
+    if (block === 'stock' || (block === 'dim' && !isRenderableText(normalized))) return next(e)
     if (block === 'dim') {
       try {
         const { Box, Markdown, Text } = $.ui.resolve(e)

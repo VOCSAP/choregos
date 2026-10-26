@@ -14,6 +14,11 @@
       "name": "mitos",
       "source": "./plugins/mitos",
       "description": "Existing file paths in replies become clickable file links."
+    },
+    {
+      "name": "thalpos",
+      "source": "./plugins/thalpos",
+      "description": "Keeps the prompt cache warm for a bounded period with cheap forked pings."
     }
   ]
 }

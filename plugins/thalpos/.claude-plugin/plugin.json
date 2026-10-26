@@ -1,0 +1,17 @@
+{
+  "name": "thalpos",
+  "version": "0.1.0",
+  "description": "Keeps the prompt cache of the main conversation warm for a bounded period with cheap forked pings.",
+  "author": {
+    "name": "VOCSAP"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "max_hours": {
+      "type": "number",
+      "title": "Maximum hours",
+      "description": "The longest period /keep-warm start accepts, in hours.",
+      "default": 12
+    }
+  }
+}

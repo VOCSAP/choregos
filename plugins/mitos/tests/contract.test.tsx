@@ -2,6 +2,8 @@ import { describe, expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { FsStat, On, SessionVersion } from 'claude-code'
 
+import { BOUNDED_PATTERNS } from '../hooks/linkify'
+
 const PLUGIN = 'mitos'
 const SUPPORTED: SessionVersion = { version: '2.1.303', base: '2.1.303' }
 const CWD = 'C:\\proj'
@@ -31,6 +33,15 @@ const DISK: Record<string, Entry> = {
   'C:/ext/x.md': { kind: 'file' },
   'C:/proj2': { kind: 'other', isLink: true },
   'C:/proj2/a.md': { kind: 'file' },
+  'C:/proj/bin.exe': { kind: 'dir' },
+  'C:/proj/sh': { kind: 'dir' },
+  'C:/proj/txt': { kind: 'file' },
+  'C:/proj/md': { kind: 'file' },
+  'C:/proj/.md': { kind: 'file' },
+  'C:/proj/bin.exe.': { kind: 'dir' },
+  'C:/proj/.exe': { kind: 'dir' },
+  'C:/proj/Setup.pkg': { kind: 'dir' },
+  'C:/proj/.claude': { kind: 'dir' },
 }
 
 type World = { stats: string[]; logs: string[] }
@@ -190,7 +201,6 @@ describe('untouched zones', () => {
   const zones = [
     '```\nsrc/a.ts\n```',
     '~~~ts\nsrc/a.ts\n~~~',
-    'run `src/a.ts` now',
     '[a](src/a.ts)',
     '![a](src/b.md)',
     '<src/a.ts>',
@@ -202,6 +212,166 @@ describe('untouched zones', () => {
       expect(await rendered($, text)).toBe(text)
     })
   }
+})
+
+describe('inline code', () => {
+  test('links a span whose whole content is an existing file, backticks kept and backslashes as typed', async ($, on) => {
+    world(on)
+    expect(await rendered($, 'run `src/a.ts` now, see `C:\\proj\\src\\b.md`')).toBe(
+      'run [`src/a.ts`](file:///C:/proj/src/a.ts) now, see [`C:\\proj\\src\\b.md`](file:///C:/proj/src/b.md)',
+    )
+  })
+
+  test('links a span with a line suffix or surrounding spaces whole', async ($, on) => {
+    world(on)
+    expect(await rendered($, 'at ` src/a.ts:42 ` and ``src/b.md``')).toBe(
+      'at [` src/a.ts:42 `](file:///C:/proj/src/a.ts) and [``src/b.md``](file:///C:/proj/src/b.md)',
+    )
+  })
+
+  const notOnePath = ['run `bun test src/a.ts` now', '`src/a.ts src/b.md`', '`src/a.ts,`', '`see src/`']
+  for (const text of notOnePath) {
+    test(`leaves ${JSON.stringify(text)} unchanged without any stat`, async ($, on) => {
+      const seen = world(on)
+      expect(await rendered($, text)).toBe(text)
+      expect(seen.stats).toEqual([])
+    })
+  }
+
+  const misread = ['[`src/a.ts`](https://example.com)', '[`src/a.ts`](https://x.com/a_(b))','```\n`src/a.ts`\n```', '\\`src/a.ts`', '`src/a.ts``', 'x`a``src/a.ts`']
+  for (const text of misread) {
+    test(`leaves the span of ${JSON.stringify(text)} unchanged`, async ($, on) => {
+      world(on)
+      expect(await rendered($, text)).toBe(text)
+    })
+  }
+
+  test('leaves a span naming a missing file or an extension-less relative name unchanged', async ($, on) => {
+    world(on)
+    const text = '`src/missing.ts` `src/lib.d` `src`'
+    expect(await rendered($, text)).toBe(text)
+  })
+
+  test('is idempotent on a linked span', async ($, on) => {
+    world(on)
+    const once = await rendered($, 'run `src/a.ts` now')
+    expect(once).toBe('run [`src/a.ts`](file:///C:/proj/src/a.ts) now')
+    expect(await rendered($, once)).toBe(once)
+  })
+})
+
+describe('directories', () => {
+  test('links an existing directory written absolute or with a final separator', async ($, on) => {
+    world(on)
+    expect(await rendered($, 'C:\\proj\\src and src/ and C:\\Windows\\, then `C:\\proj\\src\\`')).toBe(
+      '[C:\\\\proj\\\\src](file:///C:/proj/src) and [src/](file:///C:/proj/src) and [C:\\\\Windows\\\\](file:///C:/Windows), then [`C:\\proj\\src\\`](file:///C:/proj/src)',
+    )
+  })
+
+  test('a sentence period after a directory stays outside the link', async ($, on) => {
+    world(on)
+    expect(await rendered($, 'Open C:\\proj\\src. Then')).toBe('Open [C:\\\\proj\\\\src](file:///C:/proj/src). Then')
+  })
+
+  test('a name ending with a dot is never cut short to a directory', async ($, on) => {
+    world(on)
+    expect(await rendered($, 'C:\\proj\\src.\\')).toBe('C:\\proj\\src.\\')
+  })
+
+  test('a final separator never links a file', async ($, on) => {
+    world(on)
+    expect(await rendered($, 'src/a.ts/ and C:\\proj\\src\\b.md\\')).toBe('src/a.ts/ and C:\\proj\\src\\b.md\\')
+  })
+
+  test('stops at a symbolic link on the way to a directory', async ($, on) => {
+    const seen = world(on)
+    expect(await rendered($, 'C:\\ext\\ and docs/')).toBe('C:\\ext\\ and docs/')
+    expect(seen.stats).toContain('C:/ext')
+    expect(seen.stats).toContain('C:/proj/docs')
+  })
+
+  test('a directory with an executable extension stays unlinked, as an executable file does', async ($, on) => {
+    world(on)
+    const text = 'C:\\proj\\bin.exe\\ and bin.exe/ and C:\\proj\\bin.exe and C:\\proj\\.exe\\ and C:\\proj\\src\\tool.exe'
+    expect(await rendered($, text)).toBe(text)
+  })
+
+  test('a directory whose name has an extension stays unlinked, whatever the extension', async ($, on) => {
+    const seen = world(on)
+    const text = 'C:\\proj\\src\\lib.d\\ and C:\\proj\\Setup.pkg\\ and `src/folder.md/`'
+    expect(await rendered($, text)).toBe(text)
+    expect(seen.stats).toEqual([])
+  })
+
+  test('a bundle-like directory stays unlinked under a POSIX session directory, a leading-dot one is linked', async ($, on) => {
+    world(on, { cwd: '/Users/u', disk: { '/Users/u/Evil.app': { kind: 'dir' }, '/Users/u/.claude': { kind: 'dir' } } })
+    expect(await rendered($, 'Evil.app/ and .claude/')).toBe('Evil.app/ and [.claude/](file:///Users/u/.claude)')
+  })
+
+  test('a directory without an extension is linked, a leading dot and a name equal to an executable extension included', async ($, on) => {
+    world(on)
+    expect(await rendered($, 'C:\\proj\\sh\\ and C:\\proj\\.claude\\')).toBe(
+      '[C:\\\\proj\\\\sh\\\\](file:///C:/proj/sh) and [C:\\\\proj\\\\.claude\\\\](file:///C:/proj/.claude)',
+    )
+  })
+
+  test('a file named only like an allowed extension, or after a leading dot, stays unlinked', async ($, on) => {
+    world(on)
+    const text = 'see `C:/proj/txt` now, C:/proj/md and C:/proj/.md'
+    expect(await rendered($, text)).toBe(text)
+  })
+
+  test('a name ending with a dot is refused before any stat', async ($, on) => {
+    const seen = world(on)
+    expect(await rendered($, 'open `bin.exe.\\`')).toBe('open `bin.exe.\\`')
+    expect(seen.stats).toEqual([])
+  })
+
+  test('the tail of a drive-relative directory is never linked as a path relative to the session directory', async ($, on) => {
+    const seen = world(on, { disk: { ...DISK, 'C:/proj/x': { kind: 'dir' }, 'C:/proj/x/src': { kind: 'dir' } } })
+    const text = 'see D:x\\src\\ and `D:x\\src\\` now'
+    expect(await rendered($, text)).toBe(text)
+    expect(seen.stats, 'the part of D:x\\src\\ after the drive letter was resolved against the session directory').toEqual([])
+  })
+
+  test('links a POSIX absolute directory outside a POSIX session directory', async ($, on) => {
+    world(on, { cwd: '/home/u', disk: { '/opt': { kind: 'dir' }, '/opt/x': { kind: 'dir' } } })
+    expect(await rendered($, '/opt/x')).toBe('[/opt/x](file:///opt/x)')
+  })
+})
+
+describe('pattern bounds', () => {
+  // Outside a character class, `*`, `+` and `{n,}` are the only unbounded quantifiers.
+  function unboundedQuantifiers(source: string): string[] {
+    const found: string[] = []
+    let inClass = false
+    for (let i = 0; i < source.length; i++) {
+      const character = source[i]!
+      if (character === '\\') {
+        i++
+        continue
+      }
+      if (inClass) {
+        if (character === ']') inClass = false
+        continue
+      }
+      if (character === '[') inClass = true
+      else if (character === '*' || character === '+') found.push(`${character} at ${i}`)
+      else if (character === '{') {
+        const open = /^\{\d+,\}/.exec(source.slice(i))
+        if (open) found.push(`${open[0]} at ${i}`)
+      }
+    }
+    return found
+  }
+
+  test('every zone and directory pattern bounds each quantifier', () => {
+    for (const pattern of BOUNDED_PATTERNS) expect({ pattern: pattern.source, unbounded: unboundedQuantifiers(pattern.source) }).toEqual({ pattern: pattern.source, unbounded: [] })
+  })
+
+  test('the bound scan sees an unbounded quantifier outside a class only', () => {
+    expect(unboundedQuantifiers(String.raw`a+[+*]\*b{2,}c{1,3}`)).toEqual(['+ at 1', '{2,} at 9'])
+  })
 })
 
 describe('cap', () => {

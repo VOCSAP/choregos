@@ -27,6 +27,10 @@ describe('refused spellings', () => {
     ['C:\\a.md:secret', 'alternate data stream'],
     ['a.md:secret', 'alternate data stream'],
     [`a${String.fromCharCode(7)}.md`, 'control character'],
+    ['bin.exe.\\', 'trailing dot or space'],
+    ['C:\\proj\\bin.exe \\x.md', 'trailing dot or space'],
+    ['src/a.md.', 'trailing dot or space'],
+    ['.../a.md', 'trailing dot or space'],
   ]
   for (const [path, reason] of refused) {
     test(`refuses ${JSON.stringify(path)}`, () => {
@@ -37,6 +41,12 @@ describe('refused spellings', () => {
   test('accepts a local absolute and a relative path', () => {
     expect(refusedSpelling('C:\\proj\\a.md')).toBeUndefined()
     expect(refusedSpelling('src/a.md')).toBeUndefined()
+  })
+
+  test('accepts dot segments and a leading dot', () => {
+    expect(refusedSpelling('../src/./a.md')).toBeUndefined()
+    expect(refusedSpelling('..')).toBeUndefined()
+    expect(refusedSpelling('C:\\proj\\.git\\')).toBeUndefined()
   })
 })
 

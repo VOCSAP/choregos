@@ -22,6 +22,12 @@ A closed tool call keeps Claude Code's green marker and its native label, drawn 
 
 `TodoWrite`, `ToolSearch` and `NotebookEdit` draw no header of their own, MCP calls already draw a dimmed `Called <server>` row, and a typed agent is titled with its type, so they stay stock.
 
+## Tool runs
+
+On Claude Code `2.1.310` or later, two or more tool calls in a row, with no text from Claude and no prompt between them, draw as one dimmed row under the green marker: `5 calls: Bash x3, Read, claude-peers`. It names at most four tools, the most frequent first, then `+N more`, and an MCP tool by its server. It adds `, 1 error` when a call failed and `· running Bash` while a call runs. A message from a peer does not split a run, and a subagent call ends it and keeps its own row.
+
+A failed or interrupted call keeps its own rows, ctrl+o shows every call in full, and a single call keeps its header. After `--resume`, the reprinted history keeps its rows and only the calls made since are grouped.
+
 ## Configuration
 
 - Set `labels` to `fr` for `Vous`; any other value gives `You`.

@@ -4,6 +4,7 @@ import type { On, RenderViewport, SessionVersion } from 'claude-code'
 
 import { isRenderableText, NAMED_COLORS, resolveFrameConfiguration, SUPPORTED_THEME_KEYS } from '../hooks/layout'
 import { register } from '../hooks/register'
+import { computeRuns, MAX_RUN_NAMES, runSummary } from '../hooks/runs'
 
 const PLUGIN = 'prosopon'
 const CERTIFIED: SessionVersion = { version: '2.1.303', base: '2.1.303' }
@@ -284,8 +285,7 @@ async function framedOrnaments($: Engine, columns: number): Promise<string[]> {
   return [...assistant.added, ...user.added, ...rule.added]
 }
 
-// Spinner-row cue as Koryphaios detects it (SPINNER_CUE_RE with SPINNER_HEAD_RE,
-// VERB_HEAD_RE or BARE_TIMER_RE in its busy detector), restated, not imported.
+const FOOTER_HINT = /esc to interrupt/i
 const SPINNER_CUE = /\((?:\d+m\s*)?\d+s\s*·|[↑↓]\s*\d[\d.,]*k?\s*tokens\b|·\s*thinking\)/i
 const SPINNER_ROW_HEAD = [
   /^\s*(?:[✢✳✶✻✽]|[·*]\s*\p{L}+(?:…|\.\.\.))/u,
@@ -295,6 +295,10 @@ const SPINNER_ROW_HEAD = [
 
 function isSpinnerRow(line: string): boolean {
   return SPINNER_CUE.test(line) && SPINNER_ROW_HEAD.some(head => head.test(line))
+}
+
+function readsAsBusy(line: string): boolean {
+  return FOOTER_HINT.test(line) || isSpinnerRow(line)
 }
 
 describe('ornament extractor', () => {
@@ -1499,5 +1503,534 @@ describe('R11 turn rule', () => {
     expect(rule).toContain(' Brewed xxxxxxxxxxxxxxxx')
     expect(rule).not.toContain('  Brewed')
     expect([...rule].length).toBeLessThanOrEqual(78)
+  })
+})
+
+const use = (id: string, name: string, input: Record<string, unknown> = {}) => ({ type: 'tool_use', id, name, input })
+const said = (text: string) => ({ type: 'text', text })
+const answer = (id: string, isError = false) => ({ type: 'tool_result', tool_use_id: id, content: 'ok', is_error: isError })
+const assistant = (...content: unknown[]) => ({ role: 'assistant', content })
+const user = (...content: unknown[]) => ({ role: 'user', content })
+const CHANNEL_NOTE = '<channel source="claude-peers" from_peer_id="lead">Status?</channel>'
+
+const runIds = (messages: unknown[], live?: string[]): string[][] => {
+  const ids = live ?? messages.flatMap(message =>
+    (message as { content: Array<{ type: string; id?: string }> }).content.flatMap(block => (block.type === 'tool_use' ? [block.id!] : [])),
+  )
+  const seen = new Set<unknown>()
+  const runs: string[][] = []
+  for (const run of computeRuns(messages, new Set(ids)).values()) {
+    if (seen.has(run)) continue
+    seen.add(run)
+    runs.push(run.ids)
+  }
+  return runs
+}
+
+describe('R13 tool runs: computeRuns', () => {
+  test('cuts a run at non-empty assistant text and at a prompt', () => {
+    const messages = [
+      user(said('Check the build.')),
+      assistant(said('Looking.'), use('a1', 'Bash')),
+      user(answer('a1')),
+      assistant(use('a2', 'Read')),
+      user(answer('a2')),
+      assistant(said('Now the tests.'), use('b1', 'Bash')),
+      user(answer('b1')),
+      assistant(said('  '), use('b2', 'Grep')),
+      user(answer('b2')),
+      user(said('And the docs?')),
+      assistant(use('c1', 'Read')),
+      user(answer('c1')),
+      assistant(use('c2', 'Read')),
+    ]
+    expect(runIds(messages), 'assistant text and a prompt cut, blank text does not (mutant: drop the text cut)').toEqual([
+      ['a1', 'a2'],
+      ['b1', 'b2'],
+      ['c1', 'c2'],
+    ])
+  })
+
+  test('keeps parallel calls of one message and the thinking between calls in one run', () => {
+    const messages = [
+      assistant({ type: 'thinking', thinking: 'plan' }, use('p1', 'Read'), use('p2', 'Grep'), use('p3', 'Bash')),
+      user(answer('p1'), answer('p2'), answer('p3')),
+      assistant({ type: 'redacted_thinking', data: 'x' }, use('p4', 'Read')),
+    ]
+    expect(runIds(messages)).toEqual([['p1', 'p2', 'p3', 'p4']])
+  })
+
+  test('does not cut at a reminder or a peer message carried beside tool results', () => {
+    const messages = [
+      assistant(use('r1', 'Bash')),
+      user(answer('r1'), said(CHANNEL_NOTE), said('<system-reminder>Todo list is empty.</system-reminder>')),
+      assistant(use('r2', 'mcp__claude-peers__send_message')),
+    ]
+    expect(runIds(messages), 'a peer message does not cut a run (mutant: cut at any user text)').toEqual([['r1', 'r2']])
+  })
+
+  for (const subagent of ['Agent', 'Task']) {
+    test(`cuts at a ${subagent} call, which never joins a run`, () => {
+      const messages = [
+        assistant(use('s1', 'Bash'), use('s2', 'Read')),
+        user(answer('s1'), answer('s2')),
+        assistant(use('agent', subagent, { description: 'Explore', prompt: 'go' })),
+        user(answer('agent')),
+        assistant(use('s3', 'Bash')),
+        user(answer('s3')),
+        assistant(use('s4', 'Edit')),
+      ]
+      expect(runIds(messages), `the ${subagent} call cuts and stays out (mutant: let ${subagent} join a run)`).toEqual([
+        ['s1', 's2'],
+        ['s3', 's4'],
+      ])
+    })
+  }
+
+  test('leaves out a call this process never saw appended, as a resumed history', () => {
+    const messages = [
+      assistant(use('h1', 'Bash')),
+      user(answer('h1')),
+      assistant(use('h2', 'Read')),
+      user(answer('h2')),
+      user(said('Continue.')),
+      assistant(use('n1', 'Bash')),
+      user(answer('n1')),
+      assistant(use('n2', 'Bash')),
+    ]
+    expect(runIds(messages, ['n1', 'n2']), 'history stays out of every run (mutant: ignore the live set)').toEqual([['n1', 'n2']])
+  })
+
+  test('counts errored calls and names the first call without a result as running', () => {
+    const messages = [
+      assistant(use('e1', 'Bash'), use('e2', 'Read')),
+      user(answer('e1', true), answer('e2')),
+      assistant(use('e3', 'Bash'), use('e4', 'Grep')),
+      user(answer('e4', true)),
+    ]
+    const run = computeRuns(messages, new Set(['e1', 'e2', 'e3', 'e4'])).get('e1')
+    expect(run).toMatchObject({ ids: ['e1', 'e2', 'e3', 'e4'], errors: 2, running: 'Bash' })
+  })
+
+  test('drops a run holding a name that is not short printable ASCII, and reads nothing from a non-array', () => {
+    for (const name of ['Bash\u0007', 'Ba\u00efsh', 'esc to interrupt', 'x'.repeat(65), '', 42]) {
+      const messages = [assistant(use('u1', 'Bash'), { type: 'tool_use', id: 'u2', name, input: {} })]
+      expect(computeRuns(messages, new Set(['u1', 'u2'])).size, `name ${String(name)} (mutant: admit a space, or 65 characters)`).toBe(0)
+    }
+    const longest = 'x'.repeat(64)
+    const kept = computeRuns([assistant(use('u1', 'Bash'), use('u2', longest))], new Set(['u1', 'u2'])).get('u1')
+    expect(kept?.names, 'a 64-character name joins its run (mutant: refuse 64 characters)').toEqual(['Bash', longest])
+    expect(computeRuns({ messages: [] }, new Set()).size).toBe(0)
+    expect(computeRuns(undefined, new Set()).size).toBe(0)
+  })
+})
+
+describe('R13 tool runs: head summary', () => {
+  const summaryOf = (names: string[], errors = 0, running?: string): string =>
+    runSummary({ ids: names.map((_, index) => `id${index}`), names, errors, running })
+
+  test('counts every call and names the most frequent tools first, MCP tools by server', () => {
+    const names = ['Read', 'Bash', 'claude-peers', 'Bash', 'claude-peers', 'Bash']
+    expect(summaryOf(names)).toBe('6 calls: Bash x3, claude-peers x2, Read')
+    const run = computeRuns([assistant(use('m1', 'mcp__claude-peers__send_message'), use('m2', 'mcp__kleos__memory_search')), user(answer('m1'), answer('m2'))], new Set(['m1', 'm2'])).get('m1')!
+    expect(runSummary(run), 'MCP names reduced to the server (mutant: keep the full name)').toBe('2 calls: claude-peers, kleos')
+  })
+
+  test(`shows at most ${MAX_RUN_NAMES} distinct names, then how many more`, () => {
+    const names = ['Bash', 'Bash', 'Read', 'Grep', 'Edit', 'Write', 'Glob']
+    expect(summaryOf(names), 'cap on distinct names (mutant: no cap)').toBe('7 calls: Bash x2, Read, Grep, Edit, +2 more')
+  })
+
+  test('never hides an error and names the running call', () => {
+    expect(summaryOf(['Bash', 'Read'], 1)).toBe('2 calls: Bash, Read, 1 error')
+    expect(summaryOf(['Bash', 'Read', 'Bash'], 2, 'Bash')).toBe('3 calls: Bash x2, Read, 2 errors · running Bash')
+  })
+
+  test('draws no spinner-row cue and no limit row a Koryphaios screen guard reads', () => {
+    for (const line of [
+      summaryOf(['Bash', 'Read'], 0, 'Bash'),
+      summaryOf(['thinking)', 'Bash'], 1, 'thinking)'),
+      summaryOf(['Thinking...', 'Read'], 0, 'Thinking...'),
+    ]) {
+      expect(readsAsBusy(line), line).toBe(false)
+      expect(readsAsBusy(`● ${line}`), line).toBe(false)
+      expect(line.startsWith('\u23bf'), line).toBe(false)
+    }
+  })
+})
+
+const RUNS_VERSION: SessionVersion = { version: '2.1.310', base: '2.1.310' }
+const RUN_SESSION = [
+  user(said('Run the checks.')),
+  assistant(said('Looking.'), use('t1', 'Bash', { command: 'echo one' })),
+  user(answer('t1')),
+  assistant(use('t2', 'Read', { file_path: 'C:/work/a.txt' })),
+  user(answer('t2', true)),
+  assistant(use('t3', 'Bash', { command: 'echo three' })),
+  user(answer('t3'), said(CHANNEL_NOTE)),
+  assistant(said('One more.'), use('t4', 'Bash', { command: 'echo contract' })),
+  user(answer('t4')),
+  assistant(said('Done.')),
+]
+
+type RunHarness = { invalidated: Promise<void>; sinks: unknown[]; fetches: () => number }
+
+function runSession(on: On, messages: unknown = RUN_SESSION, version: SessionVersion = RUNS_VERSION): RunHarness {
+  engineBeneath(on, version)
+  let fetches = 0
+  on('session.messages', () => {
+    fetches += 1
+    return { value: messages as never }
+  })
+  let fire: () => void = () => undefined
+  const invalidated = new Promise<void>(resolve => {
+    fire = resolve
+  })
+  on('ui.invalidate', () => {
+    fire()
+    return { value: undefined }
+  })
+  return { invalidated, sinks: captureLogSinks(on), fetches: () => fetches }
+}
+
+async function appendResponses($: Engine, messages: unknown[]): Promise<void> {
+  for (const [index, message] of messages.entries()) {
+    const { role, content } = message as { role: string; content: unknown[] }
+    if (role !== 'assistant') continue
+    await $.session.append({
+      message: { type: 'assistant', role: 'assistant', content },
+      door: 'response',
+      origin: { kind: 'model', model: 'claude-test' },
+      uuid: `row-${index}`,
+    } as never)
+  }
+}
+
+async function indexedRuns($: Engine, harness: RunHarness, appended: unknown[] = RUN_SESSION): Promise<void> {
+  await appendResponses($, appended)
+  await mountTool($, { tool_use_id: 'toolu_unrelated' })
+  await harness.invalidated
+}
+
+const runTool = (id: string, tool: string, extra: Record<string, unknown> = {}) => ({
+  tool_use_id: id,
+  tool,
+  input: tool === 'Bash' ? { command: `echo ${id}` } : { file_path: 'C:/work/a.txt' },
+  ...extra,
+})
+
+describe('R13 tool runs: rendering', () => {
+  test('draws the head call as one dim row with the native green bullet, and the followers as nothing', async ($, on) => {
+    const harness = runSession(on)
+    await indexedRuns($, harness)
+    const head = await (await mountTool($, runTool('t1', 'Bash'))).drawn()
+    expect([...new Set(strings(head))], 'head row').toEqual(['● ', '3 calls: Bash x2, Read, 1 error'])
+    expect(nodesOfType(head, 'Text').find(node => strings(node).includes('● '))?.props).toMatchObject({ color: 'success' })
+    expect(nodesOfType(head, 'Text').find(node => node.props?.dimColor === true)?.props).toMatchObject({ dimColor: true, wrap: 'truncate-end' })
+    expect(nodesOfType(head, 'Box').find(node => node.props?.marginTop === 1), 'native blank row').toBeDefined()
+    expect(strings(await (await mountTool($, runTool('t3', 'Bash'))).drawn()), 'follower row').toEqual([])
+    expect(strings(await (await mountToolResult($, { tool_use_id: 't3', tool: 'Bash' })).drawn()), 'follower result').toEqual([])
+    expect(strings(await (await mountToolResult($, { tool_use_id: 't1', tool: 'Bash' })).drawn()), 'head result').toEqual([])
+  })
+
+  test('keeps a lone call native', async ($, on) => {
+    const harness = runSession(on)
+    await indexedRuns($, harness)
+    const lone = await (await mountTool($, { tool_use_id: 't4', tool: 'Bash', input: { command: 'echo contract' } })).drawn()
+    expect(strings(lone).join(''), 'a run of one keeps the R12 header').toContain('Bash(echo contract)')
+  })
+
+  test('keeps the native rows of an errored or interrupted call, under the head when it is the head', async ($, on) => {
+    const harness = runSession(on)
+    await indexedRuns($, harness)
+    const failed = await mountTool($, runTool('t2', 'Read', { isErrored: true }))
+    await expectStock(failed as unknown as Drawn, 'errored follower (mutant: hide a failed follower)', 'engine-tool: Read')
+    const cut = await mountTool($, runTool('t3', 'Bash', { isInterrupted: true }))
+    await expectStock(cut as unknown as Drawn, 'interrupted follower', 'engine-tool: Bash')
+    const result = await mountToolResult($, { tool_use_id: 't2', tool: 'Read', isErrored: true })
+    await expectStock(result as unknown as Drawn, 'errored result (mutant: hide an errored result)', 'engine-result: Read')
+    const head = strings(await (await mountTool($, runTool('t1', 'Bash', { isErrored: true }))).drawn())
+    expect(head, 'failed head keeps its native row').toContain('engine-tool: Bash')
+    expect(head, 'failed head still draws the summary').toContain('3 calls: Bash x2, Read, 1 error')
+  })
+
+  test('passes every expanded row to the engine', async ($, on) => {
+    const harness = runSession(on)
+    await indexedRuns($, harness)
+    await expectStock((await mountTool($, runTool('t1', 'Bash', { isExpanded: true }))) as unknown as Drawn, 'expanded head (mutant: drop the isExpanded passthrough)', 'engine-tool: Bash')
+    await expectStock((await mountTool($, runTool('t3', 'Bash', { isExpanded: true }))) as unknown as Drawn, 'expanded follower', 'engine-tool: Bash')
+    await expectStock((await mountToolResult($, { tool_use_id: 't3', isExpanded: true })) as unknown as Drawn, 'expanded result', 'engine-result: Bash')
+    const group = await $.ui.mount({
+      plugin: PLUGIN,
+      surface: 'terminal',
+      component: 'ToolGroup',
+      props: { calls: [{ tool_use_id: 't1', tool: 'Bash', input: {}, isRunning: false, isErrored: false, isInterrupted: false }], isActive: false, isExpanded: true, isCallsOnly: true },
+      viewport: VIEWPORT,
+    } as never)
+    await expectStock(group as unknown as Drawn, 'expanded group', 'engine-group: 1')
+  })
+
+  test('draws a calls-only group as the head or as nothing, and keeps any other group line', async ($, on) => {
+    const harness = runSession(on)
+    await indexedRuns($, harness)
+    const group = (first: string, isCallsOnly: boolean) =>
+      $.ui.mount({
+        plugin: PLUGIN,
+        surface: 'terminal',
+        component: 'ToolGroup',
+        props: { calls: [{ tool_use_id: first, tool: 'Read', input: {}, isRunning: false, isErrored: false, isInterrupted: false }], isActive: false, isExpanded: false, isCallsOnly },
+        viewport: VIEWPORT,
+      } as never)
+    expect([...new Set(strings(await (await group('t1', true)).drawn()))], 'calls-only head group').toEqual(['● ', '3 calls: Bash x2, Read, 1 error'])
+    expect(strings(await (await group('t2', true)).drawn()), 'calls-only follower group').toEqual([])
+    await expectStock((await group('t2', false)) as unknown as Drawn, 'a group holding more than calls (mutant: drop the isCallsOnly guard)', 'engine-group: 1')
+    const head = strings(await (await group('t1', false)).drawn())
+    expect(head, 'a head group holding more than calls keeps its line').toContain('engine-group: 1')
+    expect(head, 'and draws the head above it').toContain('3 calls: Bash x2, Read, 1 error')
+  })
+
+  test('draws a call native until the index holds it, then asks for one redraw per change', async ($, on) => {
+    const harness = runSession(on)
+    await appendResponses($, RUN_SESSION)
+    const [before] = await Promise.all([mountTool($, runTool('t3', 'Bash')), mountTool($, runTool('t1', 'Bash'))])
+    expect(strings(await before.drawn()).join(''), 'no index yet: the R12 header').toContain('Bash(echo t3)')
+    await harness.invalidated
+    expect(strings(await (await mountTool($, runTool('t3', 'Bash'))).drawn()), 'indexed follower').toEqual([])
+    await mountTool($, runTool('t1', 'Bash'))
+    expect(harness.fetches(), 'one fetch per generation, none while one is pending (mutant: fetch on every render)').toBe(1)
+  })
+
+  test('keeps a resumed history native: only calls appended in this process are grouped', async ($, on) => {
+    const resumed = [
+      ...RUN_SESSION,
+      user(said('Continue.')),
+      assistant(use('n1', 'Bash', { command: 'echo n1' })),
+      user(answer('n1')),
+      assistant(use('n2', 'Read')),
+      user(answer('n2')),
+    ]
+    const harness = runSession(on, resumed)
+    await indexedRuns($, harness, resumed.slice(RUN_SESSION.length))
+    const history = await mountTool($, runTool('t3', 'Bash'))
+    expect(strings(await history.drawn()).join(''), 'history follower (mutant: group calls never appended)').toContain('Bash(echo t3)')
+    expect([...new Set(strings(await (await mountTool($, runTool('n1', 'Bash'))).drawn()))], 'a call after the resume').toEqual(['● ', '2 calls: Bash, Read'])
+  })
+
+  test('stays native below 2.1.310 and when the index cannot be read', async ($, on) => {
+    const harness = runSession(on, RUN_SESSION, { version: '2.1.309', base: '2.1.309' })
+    await appendResponses($, RUN_SESSION)
+    await mountTool($, { tool_use_id: 'toolu_unrelated' })
+    for (let turn = 0; turn < 20; turn += 1) await Promise.resolve()
+    expect(strings(await (await mountTool($, runTool('t3', 'Bash'))).drawn()).join(''), '2.1.309 (mutant: runs at 2.1.303)').toContain('Bash(echo t3)')
+    expect(harness.fetches(), 'no transcript read on an unsupported version').toBe(0)
+  })
+
+  test('falls back to native and logs to debug when the transcript cannot be read', async ($, on) => {
+    engineBeneath(on, RUNS_VERSION)
+    on('session.messages', () => {
+      throw new Error('transcript unavailable')
+    })
+    const harness = { sinks: captureLogSinks(on) }
+    await appendResponses($, RUN_SESSION)
+    await mountTool($, { tool_use_id: 'toolu_unrelated' })
+    for (let turn = 0; turn < 50 && !harness.sinks.includes('debug'); turn += 1) await Promise.resolve()
+    expect(harness.sinks, 'the failure is traced in debug').toContain('debug')
+    expect(strings(await (await mountTool($, runTool('t3', 'Bash'))).drawn()).join('')).toContain('Bash(echo t3)')
+  })
+})
+
+type Deferred = { promise: Promise<unknown>; resolve: (value: unknown) => void }
+
+function deferred(): Deferred {
+  let resolve: (value: unknown) => void = () => undefined
+  const promise = new Promise<unknown>(done => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
+// A stub engine, because the testing kit's ui.resolve never throws and the order in which two
+// transcript reads resolve has to be chosen by the test.
+function directRuns() {
+  const hooks: Record<string, RenderHook> = {}
+  const recordingOn = ((event: string, matcher: unknown, handler?: unknown) => {
+    const component = (matcher as { component?: string } | undefined)?.component
+    hooks[event === 'ui.render' && component ? component : event] = (typeof matcher === 'function' ? matcher : handler) as RenderHook
+  }) as unknown as On
+  register(recordingOn, {} as never)
+  const stub = {
+    messages: [] as unknown[],
+    pending: [] as Deferred[],
+    fetches: 0,
+    invalidations: 0,
+    invalidateThrows: false,
+    resolveThrows: false,
+    resolveCalls: 0,
+    resolveFailsOn: 0,
+    sinks: [] as unknown[],
+  }
+  const engine = {
+    session: {
+      version: async () => RUNS_VERSION,
+      cwd: async () => SESSION_CWD,
+      messages: async () => {
+        stub.fetches += 1
+        const waiting = stub.pending.shift()
+        return waiting === undefined ? stub.messages : waiting.promise
+      },
+    },
+    ui: {
+      resolve: () => {
+        stub.resolveCalls += 1
+        if (stub.resolveThrows || stub.resolveCalls === stub.resolveFailsOn) throw new Error('resolver unavailable')
+        return { Box: 'Box', Markdown: 'Markdown', Text: 'Text' }
+      },
+      log: (_text: string, options: { to?: unknown }) => {
+        stub.sinks.push(options.to)
+      },
+      invalidate: () => {
+        if (stub.invalidateThrows) throw new Error('invalidate refused')
+        stub.invalidations += 1
+      },
+    },
+  } as unknown as Engine
+  const native = async () => 'native'
+  const append = async (content: unknown[], agentId?: string): Promise<void> => {
+    await hooks['session.append']!(engine, { message: { type: 'assistant', role: 'assistant', content }, door: 'response', agentId }, async e => e)
+  }
+  const appendAll = async (messages: unknown[]): Promise<void> => {
+    for (const message of messages) {
+      const { role, content } = message as { role: string; content: unknown[] }
+      if (role === 'assistant') await append(content)
+    }
+  }
+  const render = (component: 'ToolUse' | 'ToolResult' | 'ToolGroup', props: Record<string, unknown>) =>
+    hooks[component]!(
+      engine,
+      {
+        surface: 'terminal',
+        viewport: VIEWPORT,
+        props: { isRunning: false, isErrored: false, isInterrupted: false, isExpanded: false, output: { stdout: 'ok' }, ...props },
+      },
+      native,
+    )
+  const until = async (done: () => boolean): Promise<void> => {
+    for (let turn = 0; turn < 200 && !done(); turn += 1) await Promise.resolve()
+    expect(done(), 'the stubbed engine settled').toBe(true)
+  }
+  const settle = async (): Promise<void> => {
+    for (let turn = 0; turn < 200; turn += 1) await Promise.resolve()
+  }
+  return { stub, append, appendAll, render, until, settle }
+}
+
+const AFTER_COMPACTION = [user(said('Summary of the earlier conversation.')), assistant(said('Compacted.'))]
+
+describe('R13 tool runs: run index', () => {
+  test('drops from the live set the calls a compaction removed from the transcript', async () => {
+    const run = directRuns()
+    run.stub.messages = RUN_SESSION
+    await run.appendAll(RUN_SESSION)
+    await run.render('ToolUse', runTool('t1', 'Bash'))
+    await run.until(() => run.stub.invalidations === 1)
+    expect(strings(await run.render('ToolUse', runTool('t1', 'Bash'))).join(''), 'indexed head').toContain('3 calls')
+
+    run.stub.messages = AFTER_COMPACTION
+    await run.append([said('Compacted.')])
+    await run.render('ToolUse', runTool('t1', 'Bash'))
+    await run.until(() => run.stub.invalidations === 2)
+
+    const later = [user(said('Again.')), assistant(use('n1', 'Bash')), user(answer('n1')), assistant(use('n2', 'Bash')), user(answer('n2'))]
+    run.stub.messages = [...RUN_SESSION, ...later]
+    await run.appendAll(later)
+    await run.render('ToolUse', runTool('t1', 'Bash'))
+    await run.until(() => run.stub.invalidations === 3)
+    const head = strings(await run.render('ToolUse', runTool('t1', 'Bash'))).join('')
+    expect(head, 'a call compacted away is no longer live (mutant: never prune the live set)').not.toContain('3 calls')
+    expect(head, 'it draws its R12 header').toContain('Bash(echo t1)')
+    expect(strings(await run.render('ToolUse', runTool('n1', 'Bash'))).join(''), 'a call still present stays live').toContain('2 calls: Bash x2')
+  })
+
+  test('keeps the newer index when an older transcript read resolves last', async () => {
+    const run = directRuns()
+    const older = deferred()
+    const newer = deferred()
+    await run.appendAll(RUN_SESSION)
+    run.stub.pending.push(older)
+    await run.render('ToolUse', runTool('t1', 'Bash'))
+    await run.until(() => run.stub.fetches === 1)
+    await run.append([said('More.')])
+    run.stub.pending.push(newer)
+    await run.render('ToolUse', runTool('t1', 'Bash'))
+    await run.until(() => run.stub.fetches === 2)
+    newer.resolve(RUN_SESSION)
+    await run.until(() => run.stub.invalidations === 1)
+    older.resolve(RUN_SESSION.slice(0, 5))
+    await run.settle()
+    const head = strings(await run.render('ToolUse', runTool('t1', 'Bash'))).join('')
+    expect(head, 'the newer generation stays drawn (mutant: let an older read overwrite the index)').toContain('3 calls: Bash x2, Read, 1 error')
+  })
+
+  test('ignores a subagent append: no new generation and no transcript read', async () => {
+    const run = directRuns()
+    run.stub.messages = RUN_SESSION
+    await run.appendAll(RUN_SESSION)
+    await run.render('ToolUse', runTool('t1', 'Bash'))
+    await run.until(() => run.stub.invalidations === 1)
+    await run.append([use('sub1', 'Bash')], 'agent-1')
+    await run.render('ToolUse', runTool('t1', 'Bash'))
+    await run.settle()
+    expect(run.stub.fetches, 'a subagent row is not the main conversation (mutant: count every append)').toBe(1)
+  })
+
+  test('falls back to native and logs to debug when drawing a head or a follower throws', async () => {
+    const run = directRuns()
+    run.stub.messages = RUN_SESSION
+    await run.appendAll(RUN_SESSION)
+    await run.render('ToolUse', runTool('t1', 'Bash'))
+    await run.until(() => run.stub.invalidations === 1)
+    run.stub.resolveThrows = true
+    for (const [component, id] of [['ToolUse', 't1'], ['ToolUse', 't3'], ['ToolResult', 't3']] as const) {
+      run.stub.sinks.length = 0
+      expect(await run.render(component, runTool(id, 'Bash')), `${component} ${id} (mutant: rethrow from the run branch)`).toBe('native')
+      expect(run.stub.sinks, `${component} ${id} traced`).toEqual(['debug'])
+    }
+    const group = (first: string) => ({
+      calls: [{ tool_use_id: first, tool: 'Read', input: {}, isRunning: false, isErrored: false, isInterrupted: false }],
+      isActive: false,
+      isCallsOnly: true,
+    })
+    for (const id of ['t1', 't2']) {
+      run.stub.sinks.length = 0
+      expect(await run.render('ToolGroup', group(id)), `ToolGroup holding ${id} (mutant: rethrow from the ToolGroup run branch)`).toBe('native')
+      expect(run.stub.sinks, `ToolGroup holding ${id} traced`).toEqual(['debug'])
+    }
+  })
+
+  test('keeps the native row of a failed head when composing it under the head row throws', async () => {
+    const run = directRuns()
+    run.stub.messages = RUN_SESSION
+    await run.appendAll(RUN_SESSION)
+    await run.render('ToolUse', runTool('t1', 'Bash'))
+    await run.until(() => run.stub.invalidations === 1)
+    run.stub.sinks.length = 0
+    run.stub.resolveCalls = 0
+    run.stub.resolveFailsOn = 2
+    const drawn = await run.render('ToolUse', runTool('t1', 'Bash', { isErrored: true }))
+    expect(run.stub.resolveCalls, 'the head row resolved, the composition threw').toBe(2)
+    expect(drawn, 'the native row survives (mutant: rethrow from composeBelow)').toBe('native')
+    expect(run.stub.sinks, 'the composition failure is traced').toEqual(['debug'])
+  })
+
+  test('keeps the index and logs to debug when asking for a redraw throws', async () => {
+    const run = directRuns()
+    run.stub.messages = RUN_SESSION
+    run.stub.invalidateThrows = true
+    await run.appendAll(RUN_SESSION)
+    await run.render('ToolUse', runTool('t1', 'Bash'))
+    await run.until(() => run.stub.fetches === 1)
+    await run.settle()
+    expect(run.stub.sinks, 'the refused redraw is traced (mutant: rethrow from the invalidate catch)').toEqual(['debug'])
+    expect(strings(await run.render('ToolUse', runTool('t1', 'Bash'))).join(''), 'the index stands').toContain('3 calls')
   })
 })

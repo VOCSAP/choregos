@@ -9,6 +9,7 @@ import {
   SHORT_NOTE_BULLET,
   turnRule,
 } from './layout'
+import { computeRuns, type Run, runSummary, toolUseIds } from './runs'
 import { isSupported } from './versions'
 
 type Sized = { surface: string; viewport?: RenderViewport }
@@ -264,8 +265,125 @@ function dimToolResult(
   return <Box><Text dimColor wrap="truncate-end">{`${TOOL_RESULT_PREFIX}${summary}`}</Text></Box>
 }
 
+type RunIndex = { generation: number; runOf: Map<string, Run>; signature: string }
+
+function runsSignature(runOf: Map<string, Run>): string {
+  const heads: string[] = []
+  for (const [id, run] of runOf) if (run.ids[0] === id) heads.push(`${id}=${run.ids.length}:${runSummary(run)}`)
+  return heads.join('\n')
+}
+
+function runHead(
+  $: EngineInterface,
+  e: Parameters<EngineInterface['ui']['resolve']>[0],
+  run: Run,
+) {
+  const { Box, Text } = $.ui.resolve(e)
+  return (
+    <Box flexDirection="row" marginTop={1}>
+      <Text color="success">{SHORT_NOTE_BULLET}</Text>
+      <Text dimColor wrap="truncate-end">{runSummary(run)}</Text>
+    </Box>
+  )
+}
+
+function emptyRow($: EngineInterface, e: Parameters<EngineInterface['ui']['resolve']>[0]) {
+  const { Box } = $.ui.resolve(e)
+  return <Box />
+}
+
+function composeBelow(
+  $: EngineInterface,
+  e: Parameters<EngineInterface['ui']['resolve']>[0],
+  head: ReturnType<typeof runHead>,
+  native: unknown,
+) {
+  try {
+    const { Box } = $.ui.resolve(e)
+    return (
+      <Box flexDirection="column">
+        {head}
+        {native as never}
+      </Box>
+    )
+  } catch (error) {
+    stockAfter($, error)
+    return native as ReturnType<typeof runHead>
+  }
+}
+
+// One index of the main conversation's runs per generation, a generation being one row appended to it.
+// A render never waits for it: it reads the last index, possibly stale, and the fetch's resolution
+// asks every render hook again when a run changed.
+type RunState = { generation: number; requested: number; index: RunIndex | undefined; live: Set<string> }
+
+async function fetchRuns($: EngineInterface, state: RunState, wanted: number): Promise<void> {
+  let runOf = new Map<string, Run>()
+  const before = [...state.live]
+  try {
+    const version = await $.session.version()
+    if (isSupported(version.base, 'runs')) {
+      const messages = await $.session.messages({ as: 'api' })
+      runOf = computeRuns(messages, state.live)
+      if (state.generation === wanted) {
+        const present = toolUseIds(messages)
+        for (const id of before) if (!present.has(id)) state.live.delete(id)
+      }
+    } else {
+      state.live.clear()
+    }
+  } catch (error) {
+    stockAfter($, error)
+  }
+  if (state.index !== undefined && state.index.generation > wanted) return
+  const signature = runsSignature(runOf)
+  const changed = signature !== (state.index?.signature ?? '')
+  state.index = { generation: wanted, runOf, signature }
+  if (!changed) return
+  try {
+    $.ui.invalidate('ui.render')
+  } catch (error) {
+    stockAfter($, error)
+  }
+}
+
+function runOfCall($: EngineInterface, state: RunState, id: unknown): Run | undefined {
+  const { generation, index } = state
+  if ((index === undefined || index.generation !== generation) && state.requested !== generation) {
+    state.requested = generation
+    void fetchRuns($, state, generation)
+  }
+  const run = typeof id === 'string' ? index?.runOf.get(id) : undefined
+  return run !== undefined && run.ids.length > 1 ? run : undefined
+}
+
+// Only a call appended while this process runs joins a run: a resumed session's history keeps the
+// rows it was printed with.
+function recordAppend(state: RunState, message: unknown, door: unknown): void {
+  state.generation += 1
+  if (door !== 'response' || typeof message !== 'object' || message === null) return
+  const content = (message as { content?: unknown }).content
+  if (!Array.isArray(content)) return
+  for (const block of content) {
+    if (typeof block !== 'object' || block === null) continue
+    const { type, id } = block as { type?: unknown; id?: unknown }
+    if (type === 'tool_use' && typeof id === 'string') state.live.add(id)
+  }
+}
+
 export const register: Register = (on, options) => {
   const configuration = resolveFrameConfiguration(options)
+  const runs: RunState = { generation: 0, requested: -1, index: undefined, live: new Set() }
+
+  on('session.append', async ($, e, next) => {
+    const result = await next(e)
+    try {
+      if (e.agentId === undefined) recordAppend(runs, e.message, e.door)
+    } catch (error) {
+      stockAfter($, error)
+    }
+    return result
+  })
 
   on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
     const { text, origin } = e.props
@@ -290,7 +408,25 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
-    const { tool, input, isRunning, isErrored, isInterrupted, isExpanded } = e.props
+    const { tool_use_id, tool, input, isRunning, isErrored, isInterrupted, isExpanded } = e.props
+    if (e.surface === 'terminal' && isExpanded !== true && wideEnough(e)) {
+      const failed = isErrored || isInterrupted
+      let run: Run | undefined
+      let drawn: ReturnType<typeof runHead> | undefined
+      try {
+        run = runOfCall($, runs, tool_use_id)
+        if (run !== undefined && run.ids[0] === tool_use_id) drawn = runHead($, e, run)
+        else if (run !== undefined && !failed) drawn = emptyRow($, e)
+      } catch (error) {
+        stockAfter($, error)
+        return next(e)
+      }
+      if (run !== undefined) {
+        if (drawn === undefined) return next(e)
+        if (!failed || run.ids[0] !== tool_use_id) return drawn
+        return composeBelow($, e, drawn, await next(e))
+      }
+    }
     if (
       e.surface !== 'terminal' ||
       isRunning ||
@@ -324,7 +460,15 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.render', { component: 'ToolResult' }, async ($, e, next) => {
-    const { tool, output, isErrored, isExpanded } = e.props
+    const { tool_use_id, tool, output, isErrored, isExpanded } = e.props
+    if (e.surface === 'terminal' && isExpanded === false && !isErrored && wideEnough(e)) {
+      try {
+        if (runOfCall($, runs, tool_use_id) !== undefined) return emptyRow($, e)
+      } catch (error) {
+        stockAfter($, error)
+        return next(e)
+      }
+    }
     if (
       e.surface !== 'terminal' ||
       configuration.toolResults === 'full' ||
@@ -352,6 +496,25 @@ export const register: Register = (on, options) => {
       stockAfter($, error)
       return next(e)
     }
+  })
+
+  // The engine folds reads and searches into a group line of its own; inside a run that line is the
+  // head or a follower. A group holding anything but calls keeps its line, the head drawn above it.
+  on('ui.render', { component: 'ToolGroup' }, async ($, e, next) => {
+    const { calls, isExpanded, isCallsOnly } = e.props
+    if (e.surface !== 'terminal' || isExpanded !== false || !wideEnough(e)) return next(e)
+    let drawn: ReturnType<typeof runHead> | undefined
+    try {
+      const first = Array.isArray(calls) ? (calls[0] as { tool_use_id?: unknown } | undefined)?.tool_use_id : undefined
+      const run = runOfCall($, runs, first)
+      if (run !== undefined && run.ids[0] === first) drawn = runHead($, e, run)
+      else if (run !== undefined && isCallsOnly === true) drawn = emptyRow($, e)
+    } catch (error) {
+      stockAfter($, error)
+      return next(e)
+    }
+    if (drawn === undefined) return next(e)
+    return isCallsOnly === true ? drawn : composeBelow($, e, drawn, await next(e))
   })
 
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {

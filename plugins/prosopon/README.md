@@ -16,6 +16,12 @@ The layout runs on Claude Code `2.1.303` or any later release, in a terminal of 
 - Other assistant blocks are framed around what the rest of the render chain returns. A prompt typed at the composer is framed under `You`; task notifications, messages from peers or channels, and bridge or SDK turns keep the stock rendering.
 - A turn ends with a dimmed rule such as `── Baked for 3s ───…`, two columns shorter than the terminal.
 
+## Tool headers
+
+A closed tool call keeps Claude Code's green marker and its native label, drawn dimmed: `Bash(command)`, `Update(path)` for `Edit`, `Write(path)`, `Skill(name)` for a name not starting with `/`, `Fetch(url)` for `WebFetch`, `Web Search("query")` and `Agent(description)` for an agent with no type or `general-purpose`. A running, failed, interrupted or expanded call, an argument that is not short printable ASCII, a path outside the session directory and a label that would wrap differently keep the stock header.
+
+`TodoWrite`, `ToolSearch` and `NotebookEdit` draw no header of their own, MCP calls already draw a dimmed `Called <server>` row, and a typed agent is titled with its type, so they stay stock.
+
 ## Configuration
 
 - Set `labels` to `fr` for `Vous`; any other value gives `You`.

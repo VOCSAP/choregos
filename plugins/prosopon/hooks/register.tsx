@@ -58,10 +58,20 @@ function frame(
   )
 }
 
-const MAX_CUSTOM_BASH_COMMAND_LENGTH = 300
-const TOOL_HEADER_CONTINUATION_INDENT = 6
+const MAX_TOOL_HEADER_ARGUMENT_LENGTH = 300
+const MAX_TOOL_HEADER_CONTINUATIONS = 4
 
-type ToolInput = { command?: unknown }
+type ToolHeader = { title: string; detail: string }
+
+// The collapsed native row of each tool: its title, then the one input field it shows. Skill hides
+// its args, WebFetch its prompt and WebSearch its domain filters there.
+const ARGUMENT_TOOL_HEADERS = new Map([
+  ['Bash', { title: 'Bash', field: 'command', quote: '' }],
+  ['Skill', { title: 'Skill', field: 'skill', quote: '' }],
+  ['WebFetch', { title: 'Fetch', field: 'url', quote: '' }],
+  ['WebSearch', { title: 'Web Search', field: 'query', quote: '"' }],
+  ['Agent', { title: 'Agent', field: 'description', quote: '' }],
+])
 
 function hasSafeToolHeaderArgument(value: string): boolean {
   if (value.length === 0) return false
@@ -72,17 +82,22 @@ function hasSafeToolHeaderArgument(value: string): boolean {
   return true
 }
 
-function toolHeader(tool: string, input: unknown): string | undefined {
-  if (tool !== 'Bash' || typeof input !== 'object' || input === null) return undefined
-  const toolInput = input as ToolInput
-  if (
-    typeof toolInput.command !== 'string' ||
-    toolInput.command.length > MAX_CUSTOM_BASH_COMMAND_LENGTH ||
-    !hasSafeToolHeaderArgument(toolInput.command)
-  ) {
+function toolHeader(tool: string, input: unknown): ToolHeader | undefined {
+  const shape = ARGUMENT_TOOL_HEADERS.get(tool)
+  if (shape === undefined || typeof input !== 'object' || input === null) return undefined
+  const fields = input as Record<string, unknown>
+  // A typed agent is titled with its type, and agents launched together share one group row.
+  if (tool === 'Agent') {
+    const agentType = fields.subagent_type
+    if (agentType !== undefined && agentType !== 'general-purpose') return undefined
+  }
+  const value = fields[shape.field]
+  if (typeof value !== 'string' || value.length > MAX_TOOL_HEADER_ARGUMENT_LENGTH || !hasSafeToolHeaderArgument(value)) {
     return undefined
   }
-  return `Bash(${toolInput.command})`
+  // The native Skill row drops a leading slash from the name.
+  if (tool === 'Skill' && value.startsWith('/')) return undefined
+  return { title: shape.title, detail: `(${shape.quote}${value}${shape.quote})` }
 }
 
 const MAX_FILE_TOOL_PATH_LENGTH = 40
@@ -114,7 +129,7 @@ async function fileToolHeader(
   title: string,
   input: unknown,
   columns: number,
-): Promise<string | undefined> {
+): Promise<ToolHeader | undefined> {
   if (typeof input !== 'object' || input === null) return undefined
   const filePath = (input as { file_path?: unknown }).file_path
   if (typeof filePath !== 'string') return undefined
@@ -127,55 +142,39 @@ async function fileToolHeader(
   }
   const relative = relativeToolPath(filePath, cwd)
   if (relative === undefined) return undefined
-  const header = `${title}(${relative})`
-  return header.length <= columns - SHORT_NOTE_BULLET.length ? header : undefined
+  const detail = `(${relative})`
+  return title.length + detail.length <= columns - SHORT_NOTE_BULLET.length ? { title, detail } : undefined
 }
 
-// The fixed bullet is two cells, and printable ASCII aligns string indexes with terminal cells.
-function wrapToolHeader(header: string, columns: number): [string, string] {
-  const firstWidth = columns - SHORT_NOTE_BULLET.length
-  if (header.length <= firstWidth) return [header, '']
-  const splitAt = header.lastIndexOf(' ', firstWidth)
-  const end = splitAt > 0 ? splitAt : firstWidth
-  const first = header.slice(0, end)
-  const remainder = header.slice(end).trimStart()
-  const continuationWidth = columns - TOOL_HEADER_CONTINUATION_INDENT
-  const continuations: string[] = []
-  let rest = remainder
-  while (rest.length > continuationWidth) {
-    const lineBreak = rest.lastIndexOf(' ', continuationWidth)
-    const continuationEnd = lineBreak > 0 ? lineBreak : continuationWidth
-    continuations.push(rest.slice(0, continuationEnd))
-    rest = rest.slice(continuationEnd).trimStart()
-  }
-  continuations.push(rest)
-  return [first, continuations.join('\n')]
+// The native row draws the title beside a detail column that wraps under itself, after the two-cell
+// bullet; printable ASCII aligns string indexes with terminal cells.
+function continuationIndent(header: ToolHeader): number {
+  return SHORT_NOTE_BULLET.length + header.title.length
 }
 
-function needsMidWordWrap(header: string, columns: number): boolean {
-  let rest = header
-  let width = columns - SHORT_NOTE_BULLET.length
+function detailLines(header: ToolHeader, columns: number): string[] | undefined {
+  const width = columns - continuationIndent(header)
+  const lines: string[] = []
+  let rest = header.detail
   while (rest.length > width) {
     const splitAt = rest.lastIndexOf(' ', width)
-    if (splitAt <= 0) return true
+    if (splitAt <= 0 || lines.length === MAX_TOOL_HEADER_CONTINUATIONS) return undefined
+    lines.push(rest.slice(0, splitAt))
     rest = rest.slice(splitAt).trimStart()
-    width = columns - TOOL_HEADER_CONTINUATION_INDENT
   }
-  return false
-}
-
-function fitsNativeBashHeader(header: string, columns: number): boolean {
-  const [, continuation] = wrapToolHeader(header, columns)
-  return continuation === '' || continuation.split('\n').length <= 4
+  lines.push(rest)
+  return lines
 }
 
 function dimToolHeader(
   $: EngineInterface,
   e: Parameters<EngineInterface['ui']['resolve']>[0],
-  header: string,
+  header: ToolHeader,
+  lines: string[],
 ) {
   const { Box, Text } = $.ui.resolve(e)
-  const [first, continuation] = wrapToolHeader(header, columnsOf(e))
+  const first = `${header.title}${lines[0]}`
+  const continuation = lines.slice(1).join('\n')
   return (
     <Box flexDirection="column" marginTop={1}>
       <Box flexDirection="row">
@@ -183,7 +182,7 @@ function dimToolHeader(
         <Text dimColor>{first}</Text>
       </Box>
       {continuation !== '' && (
-        <Box paddingLeft={TOOL_HEADER_CONTINUATION_INDENT}>
+        <Box paddingLeft={continuationIndent(header)}>
           <Text dimColor>{continuation}</Text>
         </Box>
       )}
@@ -302,24 +301,26 @@ export const register: Register = (on, options) => {
     ) {
       return next(e)
     }
-    const columns = columnsOf(e)
-    const fileTitle = FILE_TOOL_TITLES.get(tool)
-    let header: string | undefined
-    if (fileTitle !== undefined) {
-      header = (await layoutSupported($)) ? await fileToolHeader($, fileTitle, input, columns) : undefined
-    } else {
-      header = toolHeader(tool, input)
-      if (header !== undefined && (needsMidWordWrap(header, columns) || !fitsNativeBashHeader(header, columns) || !(await layoutSupported($)))) {
-        header = undefined
-      }
-    }
-    if (header === undefined) return next(e)
+    let drawn: ReturnType<typeof dimToolHeader> | undefined
     try {
-      return dimToolHeader($, e, header)
+      const columns = columnsOf(e)
+      const fileTitle = FILE_TOOL_TITLES.get(tool)
+      let header: ToolHeader | undefined
+      let lines: string[] | undefined
+      if (fileTitle !== undefined) {
+        header = (await layoutSupported($)) ? await fileToolHeader($, fileTitle, input, columns) : undefined
+        lines = header === undefined ? undefined : [header.detail]
+      } else {
+        header = toolHeader(tool, input)
+        lines = header === undefined ? undefined : detailLines(header, columns)
+        if (lines !== undefined && !(await layoutSupported($))) lines = undefined
+      }
+      if (header !== undefined && lines !== undefined) drawn = dimToolHeader($, e, header, lines)
     } catch (error) {
       stockAfter($, error)
       return next(e)
     }
+    return drawn === undefined ? next(e) : drawn
   })
 
   on('ui.render', { component: 'ToolResult' }, async ($, e, next) => {

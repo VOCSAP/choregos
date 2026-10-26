@@ -1051,7 +1051,7 @@ describe('R12 tool headers', () => {
     expect(nextCalls, 'Bash words requiring a mid-word wrap reach next').toBe(2)
   })
 
-  test('delegates Bash commands over 300 UTF-16 code units before a third command read', async () => {
+  test('delegates Bash commands over 300 UTF-16 code units after a single command read', async () => {
     const renders: Record<string, (engine: Engine, event: unknown, next: (event: unknown) => Promise<unknown>) => Promise<unknown>> = {}
     const recordingOn = ((event: string, matcher: { component?: string }, handler: (engine: Engine, input: unknown, next: (event: unknown) => Promise<unknown>) => Promise<unknown>) => {
       if (event === 'ui.render' && matcher.component) renders[matcher.component] = handler
@@ -1065,7 +1065,7 @@ describe('R12 tool headers', () => {
     const input = Object.defineProperty({}, 'command', {
       get(): string {
         reads += 1
-        if (reads > 2) throw new Error('command read after length bound')
+        if (reads > 1) throw new Error('command read twice')
         return `echo ${'a'.repeat(301)}`
       },
     })
@@ -1080,7 +1080,180 @@ describe('R12 tool headers', () => {
       return input
     })
     expect(nextCalls, 'Bash command over 300 UTF-16 code units reaches next once').toBe(1)
-    expect(reads, 'Bash command was read only through its length bound').toBe(2)
+    expect(reads, 'Bash command was read once').toBe(1)
+  })
+
+  const nativeHeaders: Array<[string, Record<string, unknown>, string, string]> = [
+    ['Skill', { skill: 'probe-skill', args: 'alpha beta' }, 'Skill(probe-skill)', 'show the skill args'],
+    ['WebFetch', { url: 'https://example.com/page', prompt: 'Summarize the page' }, 'Fetch(https://example.com/page)', 'title it WebFetch'],
+    ['WebSearch', { query: 'prosopon probe query', allowed_domains: ['example.com'] }, 'Web Search("prosopon probe query")', 'drop the quotes'],
+    ['Agent', { description: 'Probe the agent row', prompt: 'say hi', subagent_type: 'general-purpose' }, 'Agent(Probe the agent row)', 'show the prompt'],
+  ]
+  for (const [tool, input, header, mutant] of nativeHeaders) {
+    test(`redraws a closed ${tool} header as its native ${header}`, async ($, on) => {
+      engineBeneath(on)
+      const tree = await (await mountTool($, { tool, input })).drawn()
+      expect([...new Set(strings(tree))], `${tool} header (mutant: drop ${tool} from the table, or ${mutant})`).toEqual(['● ', header])
+      const bullet = nodesOfType(tree, 'Text').find(node => strings(node).includes('● '))
+      expect(bullet?.props, `${tool} green bullet`).toMatchObject({ color: 'success' })
+      const detail = nodesOfType(tree, 'Text').find(node => strings(node).includes(header))
+      expect(detail?.props, `${tool} dim detail`).toMatchObject({ dimColor: true })
+      expect(nodesOfType(tree, 'Box').find(node => node.props?.marginTop === 1), `${tool} native blank row`).toBeDefined()
+    })
+  }
+
+  test('redraws an untyped Agent header as Agent(description)', async ($, on) => {
+    engineBeneath(on)
+    const drawn = strings(await (await mountTool($, { tool: 'Agent', input: { description: 'No type agent', prompt: 'say hi' } })).drawn())
+    expect([...new Set(drawn)], 'untyped Agent (mutant: require subagent_type)').toEqual(['● ', 'Agent(No type agent)'])
+  })
+
+  test('keeps native the tools that draw no white header and a skill the native row renames', async ($, on) => {
+    engineBeneath(on)
+    const native: Array<[string, Record<string, unknown>]> = [
+      ['TodoWrite', { todos: [{ content: 'Probe item', status: 'pending', activeForm: 'Probing item' }] }],
+      ['ToolSearch', { query: 'select:mcp__probe__echo', max_results: 1 }],
+      ['NotebookEdit', { notebook_path: 'C:/work/nb.ipynb', cell_id: 'c1', new_source: 'print(2)' }],
+      ['mcp__probe__echo', { text: 'hello' }],
+      ['Agent', { description: 'Explore the probe', prompt: 'say hi', subagent_type: 'Explore' }],
+      ['Read', { file_path: 'C:/work/read.txt' }],
+      ['Skill', { skill: '/probe-skill' }],
+    ]
+    for (const [tool, input] of native) {
+      expect(strings(await (await mountTool($, { tool, input })).drawn()), `native ${tool} (mutant: add ${tool} to the table)`).toContain(`engine-tool: ${tool}`)
+    }
+  })
+
+  test('wraps a Web Search header under its detail column as the native row does at 40 columns', async ($, on) => {
+    engineBeneath(on)
+    const query = 'one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen'
+    const tree = await (await mountTool($, { tool: 'WebSearch', input: { query } }, { columns: 40, rows: 24 })).drawn()
+    expect([...new Set(strings(tree))], 'native 40-column Web Search rows (mutant: wrap the title with the detail)').toEqual([
+      '● ',
+      'Web Search("one two three four five',
+      'six seven eight nine ten\neleven twelve thirteen\nfourteen fifteen")',
+    ])
+    const continuation = nodesOfType(tree, 'Box').find(node => node.props?.paddingLeft !== undefined)
+    expect(continuation?.props, 'Web Search continuation under its detail (mutant: indent at 6)').toMatchObject({ paddingLeft: 12 })
+  })
+
+  test('delegates a titled header whose detail needs a mid-word wrap', async ($, on) => {
+    engineBeneath(on)
+    const narrow = { columns: 40, rows: 24 }
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ['Skill', { skill: 'probe-skill-with-a-rather-long-name-for-wrapping' }],
+      ['WebSearch', { query: 'a'.repeat(40) }],
+      ['WebFetch', { url: `https://example.com/${'p'.repeat(40)}` }],
+    ]
+    for (const [tool, input] of cases) {
+      expect(strings(await (await mountTool($, { tool, input }, narrow)).drawn()), `${tool} mid-word wrap (mutant: hard-break the word)`).toContain(`engine-tool: ${tool}`)
+    }
+  })
+
+  test('keeps unsafe, empty or overlong arguments of every titled tool native', async ($, on) => {
+    engineBeneath(on)
+    const fields: Array<[string, string]> = [['Skill', 'skill'], ['WebFetch', 'url'], ['WebSearch', 'query'], ['Agent', 'description']]
+    for (const [tool, field] of fields) {
+      for (const [label, value] of [['empty', ''], ['escape', 'a\u001bb'], ['CJK', '漢'], ['newline', 'a\nb'], ['301 code units', 'a '.repeat(150) + 'a'], ['number', 7]] as Array<[string, unknown]>) {
+        expect(strings(await (await mountTool($, { tool, input: { [field]: value } })).drawn()), `${tool} ${label} (mutant: drop the R12 check)`).toContain(`engine-tool: ${tool}`)
+      }
+    }
+  })
+
+  test('keeps DEL and C1 controls native in Bash and titled tool arguments', async () => {
+    const hook = recordRenderHooks().ToolUse!
+    const controls: Array<[string, string]> = [['DEL', String.fromCharCode(0x7f)], ['C1 next line', String.fromCharCode(0x85)]]
+    const fields: Array<[string, string]> = [['Bash', 'command'], ['Skill', 'skill'], ['WebSearch', 'query']]
+    for (const [label, control] of controls) {
+      for (const [tool, field] of fields) {
+        const drawn = await hook(RECORDING_ENGINE, {
+          surface: 'terminal',
+          viewport: VIEWPORT,
+          props: { tool, input: { [field]: `a${control}b` }, isRunning: false, isErrored: false, isInterrupted: false },
+        }, async () => 'native')
+        expect(drawn, `${tool} ${label} (mutant: widen the printable ASCII range)`).toBe('native')
+      }
+    }
+  })
+
+  test('redraws an argument of exactly 300 code units', async ($, on) => {
+    engineBeneath(on)
+    const wide = { columns: 120, rows: 24 }
+    const words = `${'abcd '.repeat(60).slice(0, 299)}z`
+    expect(words.length, 'fixture length').toBe(300)
+    const cases: Array<[string, Record<string, unknown>, string]> = [
+      ['Bash', { command: `echo ${words.slice(5)}` }, 'Bash(echo '],
+      ['WebSearch', { query: words }, 'Web Search("abcd'],
+    ]
+    for (const [tool, input, head] of cases) {
+      const drawn = strings(await (await mountTool($, { tool, input }, wide)).drawn())
+      expect(drawn.join('\n'), `${tool} 300 code units custom (mutant: bound at 299)`).toContain(head)
+      expect(drawn, `${tool} 300 code units not delegated`).not.toContain(`engine-tool: ${tool}`)
+    }
+  })
+
+  const throwingEngine = (sinks: unknown[]): Engine => ({
+    session: { version: async () => CERTIFIED },
+    ui: { resolve: () => ({ Box: 'Box', Text: 'Text' }), log: (_message: string, options: { to?: unknown }) => sinks.push(options?.to) },
+  }) as unknown as Engine
+
+  test('falls back to native and logs to debug when a titled tool input getter throws', async () => {
+    const hook = recordRenderHooks().ToolUse!
+    const hostile: Array<[string, Record<string, unknown>, string]> = [
+      ['Skill', {}, 'skill'],
+      ['Agent', { description: 'Probe' }, 'subagent_type'],
+    ]
+    for (const [tool, base, field] of hostile) {
+      const sinks: unknown[] = []
+      const input = Object.defineProperty({ ...base }, field, { get(): never { throw new Error('hostile getter') } })
+      const drawn = await hook(throwingEngine(sinks), {
+        surface: 'terminal',
+        viewport: VIEWPORT,
+        props: { tool, input, isRunning: false, isErrored: false, isInterrupted: false },
+      }, async () => 'native')
+      expect(drawn, `${tool}.${field} getter that throws reaches next (mutant: read the input outside the try)`).toBe('native')
+      expect(sinks, `${tool}.${field} getter error logged to debug`).toEqual(['debug'])
+    }
+  })
+
+  test('reads the agent type once', async () => {
+    const hook = recordRenderHooks().ToolUse!
+    let reads = 0
+    const input = Object.defineProperty({ description: 'Probe' }, 'subagent_type', {
+      get(): string {
+        reads += 1
+        return reads === 1 ? 'Explore' : 'general-purpose'
+      },
+    })
+    const drawn = await hook(RECORDING_ENGINE, {
+      surface: 'terminal',
+      viewport: VIEWPORT,
+      props: { tool: 'Agent', input, isRunning: false, isErrored: false, isInterrupted: false },
+    }, async () => 'native')
+    expect(drawn, 'an agent typed Explore on its first read stays native (mutant: read subagent_type twice)').toBe('native')
+    expect(reads, 'subagent_type read once').toBe(1)
+  })
+
+  test('reads the shown field of every titled tool once', async () => {
+    const hook = recordRenderHooks().ToolUse!
+    const fields: Array<[string, string]> = [['Skill', 'skill'], ['WebFetch', 'url'], ['WebSearch', 'query'], ['Agent', 'description']]
+    for (const [tool, field] of fields) {
+      let reads = 0
+      const input = Object.defineProperty({}, field, {
+        get(): string {
+          reads += 1
+          if (reads > 1) throw new Error(`${field} read twice`)
+          return 'probe'
+        },
+      })
+      const drawn = await hook(RECORDING_ENGINE, {
+        surface: 'terminal',
+        viewport: VIEWPORT,
+        props: { tool, input, isRunning: false, isErrored: false, isInterrupted: false },
+      }, async () => 'native')
+      expect(drawn, `${tool} custom header`).not.toBe('native')
+      expect(reads, `${tool} ${field} read once (mutant: re-read the field to interpolate it)`).toBe(1)
+    }
   })
 
   test('keeps five Bash header rows custom and delegates six', async ($, on) => {

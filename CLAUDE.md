@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Choregos is a Claude Code plugin marketplace (`.claude-plugin/marketplace.json`). Each plugin under `plugins/<name>/` is a **mod**: a TypeScript hooks module (`hooks/hooks.json` lists `register.ts(x)`) that runs inside Claude Code's engine and hooks its render chain. There is no `package.json`, no bundler and no `node_modules`: the `claude` binary is the runtime, the type source (`import ... from 'claude-code'`) and the test runner.
 
-- `prosopon` -- frames prompts and assistant blocks, dims short notes, draws a turn rule, redraws closed `Bash`/`Edit`/`Write` tool headers.
+- `prosopon` -- frames prompts and assistant blocks, dims short notes, draws a turn rule, redraws closed `Bash`/`Edit`/`Write`/`Skill`/`WebFetch`/`WebSearch`/untyped `Agent` tool headers.
 - `mitos` -- rewrites bare file paths in assistant text into `[path](file:///...)` links, after checking them on disk.
 
 ## Commands

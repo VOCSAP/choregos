@@ -58,13 +58,19 @@ function engineBeneath(on: On, version: SessionVersion | 'reject' = CERTIFIED, c
 
 type RenderHook = (engine: Engine, event: unknown, next: (event: unknown) => Promise<unknown>) => Promise<unknown>
 
-function recordRenderHooks(): Record<string, RenderHook> {
+function recordRenderHooks(options: Record<string, unknown> = {}): Record<string, RenderHook> {
   const renders: Record<string, RenderHook> = {}
   const recordingOn = ((event: string, matcher: { component?: string }, handler: RenderHook) => {
     if (event === 'ui.render' && matcher.component) renders[matcher.component] = handler
   }) as unknown as On
-  register(recordingOn, {} as never)
+  register(recordingOn, options as never)
   return renders
+}
+
+function toolResultHook(options: Record<string, unknown>): RenderHook {
+  const hook = recordRenderHooks(options).ToolResult
+  expect(hook, 'ToolResult render hook registered').toBeDefined()
+  return hook!
 }
 
 const RECORDING_ENGINE = {
@@ -158,13 +164,17 @@ function mountTool(
   }) as Promise<ToolUse>
 }
 
-function mountToolResult($: Engine): Promise<ToolResult> {
+function mountToolResult(
+  $: Engine,
+  props: Record<string, unknown> = {},
+  viewport: RenderViewport = VIEWPORT,
+): Promise<ToolResult> {
   return $.ui.mount({
     plugin: PLUGIN,
     surface: 'terminal',
     component: 'ToolResult',
-    props: { tool_use_id: 'toolu_contract', tool: 'Bash', output: { stdout: 'native result' }, isErrored: false },
-    viewport: VIEWPORT,
+    props: { tool_use_id: 'toolu_contract', tool: 'Bash', output: { stdout: 'native result' }, isErrored: false, isExpanded: false, ...props },
+    viewport,
   } as never) as Promise<ToolResult>
 }
 
@@ -746,6 +756,7 @@ describe('R10 prompt frame', () => {
       assistantLabel: 'Claude',
       userColor: 'permission',
       assistantColor: '#1a2B3c',
+      toolResults: 'summary',
     })
     expect(resolveFrameConfiguration({ labels: 'fr' })).toMatchObject({ userLabel: 'Vous' })
     expect(resolveFrameConfiguration({ labels: 'fr', user_label: '' })).toMatchObject({ userLabel: 'Vous' })
@@ -759,6 +770,7 @@ describe('R10 prompt frame', () => {
       assistantLabel: 'Claude',
       userColor: 'suggestion',
       assistantColor: 'claude',
+      toolResults: 'summary',
     })
     for (const control of [
       0x061c, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069,
@@ -815,14 +827,15 @@ describe('R10 prompt frame', () => {
     expect(borderedBoxes(await (await mountReply($, REPLY)).drawn())[0]?.props?.borderColor).toBe(NAMED_COLORS.orange)
   })
 
-  test('reads each frame option once while rendering multiple frames', async () => {
-    const optionReads = { labels: 0, userLabel: 0, userColor: 0, assistantColor: 0 }
+  test('reads each configured option once while rendering multiple frames', async () => {
+    const optionReads = { labels: 0, userLabel: 0, userColor: 0, assistantColor: 0, toolResults: 0 }
     const renders: Record<string, (engine: Engine, event: unknown, next: (event: unknown) => Promise<unknown>) => Promise<unknown>> = {}
     const countedOptions = {
       get labels() { optionReads.labels += 1; return 'fr' },
       get user_label() { optionReads.userLabel += 1; return 'Operator' },
       get user_color() { optionReads.userColor += 1; return 'success' },
       get assistant_color() { optionReads.assistantColor += 1; return 'permission' },
+      get tool_results() { optionReads.toolResults += 1; return 'summary' },
     }
     const recordingOn = ((event: string, matcher: { component?: string }, handler: (engine: Engine, input: unknown, next: (event: unknown) => Promise<unknown>) => Promise<unknown>) => {
       if (event === 'ui.render' && matcher.component) renders[matcher.component] = handler
@@ -841,7 +854,7 @@ describe('R10 prompt frame', () => {
     await renders.UserMessage!(engine, userEvent, next)
     await renders.AssistantMessage!(engine, assistantEvent, next)
     await renders.AssistantMessage!(engine, assistantEvent, next)
-    expect(optionReads).toEqual({ labels: 1, userLabel: 1, userColor: 1, assistantColor: 1 })
+    expect(optionReads).toEqual({ labels: 1, userLabel: 1, userColor: 1, assistantColor: 1, toolResults: 1 })
   })
 
   const origins: Array<[string, unknown]> = [
@@ -1089,10 +1102,187 @@ describe('R12 tool headers', () => {
     expect(strings(await (await mountTool($, { isExpanded: undefined })).drawn())).toContain('Bash(echo contract)')
   })
 
-  test('keeps tool results, diffs, and groups native', async ($, on) => {
+  test('keeps diffs and groups native while compacting a closed Bash result', async ($, on) => {
     engineBeneath(on)
-    expect(strings(await (await mountToolResult($)).drawn())).toContain('engine-result: Bash')
+    expect(strings(await (await mountToolResult($)).drawn()).join('')).toContain('native result')
     expect(strings(await (await mountToolGroup($)).drawn())).toContain('engine-group: 0')
+  })
+})
+
+describe('Tool result compaction', () => {
+  test('summarizes successful Bash, Write, Edit, and Update results at every supported width', async ($, on) => {
+    engineBeneath(on)
+    const cases: Array<[string, Record<string, unknown>, string]> = [
+      ['Bash', { output: { stdout: 'first line\nlast line' } }, 'last line'],
+      ['Write', { output: { content: 'first line\nsecond line' } }, 'Wrote 2 lines'],
+      ['Edit', { output: { structuredPatch: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 2, lines: [' first', '-old line', '+new line', '+next line'] }] } }, '+2 -1'],
+      ['Update', { output: { structuredPatch: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 2, lines: [' first', '-old line', '+new line', '+next line'] }] } }, '+2 -1'],
+    ]
+    for (const columns of WIDTHS) {
+      for (const [tool, props, expected] of cases) {
+        const tree = await (await mountToolResult($, { tool, ...props }, { columns, rows: 24 })).drawn()
+        expect(strings(tree).join(''), `${tool} summary at ${columns} columns (mutant: delegate every successful targeted result)`).toContain(expected)
+      }
+    }
+  })
+
+  test('keeps malformed or overlarge Edit patches native', async () => {
+    const patches = [
+      {},
+      { structuredPatch: [{ lines: ['+line', 1] }] },
+      { structuredPatch: [{ lines: Array.from({ length: 10_001 }, () => '+line') }] },
+    ]
+    for (const output of patches) {
+      const result = await toolResultHook({})(RECORDING_ENGINE, {
+        surface: 'terminal', viewport: VIEWPORT, props: { tool: 'Edit', output, isErrored: false, isExpanded: false },
+      }, async () => 'native')
+      expect(result, 'malformed or overlarge patches delegate natively (mutant: accept malformed or unbounded patches)').toBe('native')
+    }
+  })
+
+  test('keeps non-array Edit patch hunks native', async () => {
+    for (const output of [
+      { structuredPatch: ['+line'] },
+      { structuredPatch: [{ lines: '+line' }] },
+    ]) {
+      const result = await toolResultHook({})(RECORDING_ENGINE, {
+        surface: 'terminal', viewport: VIEWPORT, props: { tool: 'Edit', output, isErrored: false, isExpanded: false },
+      }, async () => 'native')
+      expect(result, 'non-array hunk or lines delegate natively (mutant: weaken Array.isArray(lines))').toBe('native')
+    }
+  })
+
+  test('reads each structuredPatch field once before summarizing Edit', async () => {
+    let patchReads = 0
+    let lineReads = 0
+    const hunk = Object.defineProperty({}, 'lines', {
+      get(): string[] {
+        lineReads += 1
+        if (lineReads > 1) throw new Error('lines read more than once')
+        return [' first', '-old line', '+new line', '+next line']
+      },
+    })
+    const output = Object.defineProperty({}, 'structuredPatch', {
+      get(): object[] {
+        patchReads += 1
+        if (patchReads > 1) throw new Error('structuredPatch read more than once')
+        return [hunk]
+      },
+    })
+    const result = await toolResultHook({})(RECORDING_ENGINE, {
+      surface: 'terminal', viewport: VIEWPORT, props: { tool: 'Edit', output, isErrored: false, isExpanded: false },
+    }, async () => 'native')
+    expect(strings(result).join(''), 'structuredPatch output renders one Edit summary (mutant: ignore structuredPatch)').toContain('+2 -1')
+    expect(patchReads, 'structuredPatch getter is read once (mutant: read structuredPatch twice)').toBe(1)
+    expect(lineReads, 'hunk lines getter is read once (mutant: read hunk lines twice)').toBe(1)
+  })
+
+  test('uses Bash returnCodeInterpretation without inventing an exit code', async () => {
+    const result = await toolResultHook({})(RECORDING_ENGINE, {
+      surface: 'terminal', viewport: VIEWPORT, props: {
+        tool: 'Bash',
+        output: { stdout: 'ignored stdout', returnCodeInterpretation: 'No matches found' },
+        isErrored: false,
+        isExpanded: false,
+      },
+    }, async () => 'native')
+    expect(strings(result).join(''), 'returnCodeInterpretation replaces stdout when present (mutant: omit returnCodeInterpretation)').toContain('No matches found')
+    expect(strings(result).join(''), 'Bash summary omits fabricated exit status (mutant: default an absent exitCode to zero)').not.toContain('exit')
+  })
+
+  test('summarizes Bash stdout when returnCodeInterpretation is an empty string', async () => {
+    const result = await toolResultHook({})(RECORDING_ENGINE, {
+      surface: 'terminal', viewport: VIEWPORT, props: {
+        tool: 'Bash',
+        output: { stdout: 'first line\nlast line', returnCodeInterpretation: '' },
+        isErrored: false,
+        isExpanded: false,
+      },
+    }, async () => 'native')
+    expect(strings(result).join(''), 'an empty returnCodeInterpretation falls back to the last stdout line (mutant: treat an empty returnCodeInterpretation as present)').toContain('last line')
+  })
+
+  test('sanitizes and bounds a Bash returnCodeInterpretation before drawing it', async () => {
+    let interpretationReads = 0
+    const ansi = `${String.fromCharCode(0x1b)}[31m`
+    const bidi = [0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069]
+      .map(code => String.fromCodePoint(code))
+      .join('')
+    const output = Object.defineProperty({}, 'returnCodeInterpretation', {
+      get(): string {
+        interpretationReads += 1
+        if (interpretationReads > 1) throw new Error('returnCodeInterpretation read more than once')
+        return `first\n${'a'.repeat(300)}${ansi}${bidi}`
+      },
+    })
+    const result = await toolResultHook({})(RECORDING_ENGINE, {
+      surface: 'terminal', viewport: VIEWPORT, props: { tool: 'Bash', output, isErrored: false, isExpanded: false },
+    }, async () => 'native')
+    const [rendered] = strings(result)
+    const detail = rendered!.slice(2)
+    expect(interpretationReads, 'Bash returnCodeInterpretation read once (mutant: read raw output twice)').toBe(1)
+    expect(detail, 'Bash returnCodeInterpretation removes ANSI and bidi controls in its retained tail (mutant: remove printable ASCII filter)').toBe(`${'a'.repeat(50)}[31m`)
+    expect(detail.length, 'Bash summary is bounded (mutant: remove summary length bound)').toBeLessThanOrEqual(80)
+  })
+
+  test('truncates a long Bash summary instead of wrapping it', async () => {
+    const result = await toolResultHook({})(RECORDING_ENGINE, {
+      surface: 'terminal', viewport: { columns: 40, rows: 24 }, props: {
+        tool: 'Bash', output: { stdout: 'a'.repeat(60) }, isErrored: false, isExpanded: false,
+      },
+    }, async () => 'native')
+    expect(result, 'Bash result text truncates at narrow widths (mutant: remove truncate-end wrap)').toMatchObject({
+      children: [{ props: { wrap: 'truncate-end' } }],
+    })
+  })
+
+  test('falls back to native rendering when a Bash result getter throws', async () => {
+    let logs = 0
+    const output = Object.defineProperty({}, 'stdout', {
+      get(): string {
+        throw new Error('stdout getter failed')
+      },
+    })
+    const engine = { ...RECORDING_ENGINE, ui: { ...RECORDING_ENGINE.ui, log: () => { logs += 1 } } }
+    const result = await toolResultHook({})(engine, {
+      surface: 'terminal', viewport: VIEWPORT, props: { tool: 'Bash', output, isErrored: false, isExpanded: false },
+    }, async () => 'native')
+    expect(result, 'throwing result data falls back to native rendering (mutant: build summary outside try)').toBe('native')
+    expect(logs, 'throwing result data reaches debug logging (mutant: omit stockAfter)').toBe(1)
+  })
+
+  test('uses header or full tool_results modes without changing native fallback branches', async () => {
+    const headerEvent = {
+      surface: 'terminal', viewport: VIEWPORT, props: { tool: 'Bash', output: { stdout: 'native' }, isErrored: false, isExpanded: false },
+    }
+    const header = await toolResultHook({ tool_results: 'header' })(RECORDING_ENGINE, headerEvent, async () => 'native')
+    expect(strings(header), 'header mode omits the result detail (mutant: render a summary in header mode)').toEqual([])
+
+    for (const [label, options, surface, viewport, props] of [
+      ['full mode', { tool_results: 'full' }, 'terminal', VIEWPORT, {}],
+      ['expanded result', { tool_results: 'summary' }, 'terminal', VIEWPORT, { isExpanded: true }],
+      ['unspecified expansion', { tool_results: 'summary' }, 'terminal', VIEWPORT, { isExpanded: undefined }],
+      ['error result', { tool_results: 'summary' }, 'terminal', VIEWPORT, { isErrored: true }],
+      ['remote surface', { tool_results: 'summary' }, 'desktop', VIEWPORT, {}],
+      ['narrow terminal', { tool_results: 'summary' }, 'terminal', { columns: 39, rows: 24 }, {}],
+      ['other header tool', { tool_results: 'header' }, 'terminal', VIEWPORT, { tool: 'Read' }],
+    ] as Array<[string, Record<string, unknown>, string, RenderViewport, Record<string, unknown>]>) {
+      const event = {
+        surface, viewport, props: { tool: 'Bash', output: { stdout: 'native' }, isErrored: false, isExpanded: false, ...props },
+      }
+      const result = await toolResultHook(options)(RECORDING_ENGINE, event, async () => 'native')
+      expect(result, `${label} delegates to native rendering (mutant: compact an excluded result)`).toBe('native')
+    }
+  })
+
+  test('uses summary for absent or invalid tool_results values', async ($, on) => {
+    engineBeneath(on)
+    for (const tool_results of [undefined, 'unexpected']) {
+      const result = await toolResultHook({ tool_results })(RECORDING_ENGINE, {
+        surface: 'terminal', viewport: VIEWPORT, props: { tool: 'Bash', output: { stdout: 'last line' }, isErrored: false, isExpanded: false },
+      }, async () => 'native')
+      expect(strings(result).join(''), `${String(tool_results)} falls back to summary (mutant: use invalid configuration as full)`).toContain('last line')
+    }
   })
 })
 

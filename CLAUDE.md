@@ -51,7 +51,7 @@ Draft specs for plugins not yet built live in `docs/specs/`.
 
 ### Issue tracker
 
-Issues live as cards on the claude-peers shared roadmap (`mcp__claude-peers__roadmap_*`), not GitHub Issues. See `docs/agents/issue-tracker.md`.
+Issues live as cards on the claude-peers shared roadmap (`mcp__kory-roadmap__roadmap_*`), not GitHub Issues. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

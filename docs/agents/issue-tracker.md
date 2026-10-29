@@ -1,6 +1,6 @@
 # Issue tracker: claude-peers roadmap
 
-Issues and specs for this repo live as cards on the claude-peers shared roadmap, scoped to this repository and shared by every session. Use the `mcp__claude-peers__roadmap_*` tools; GitHub Issues are not used.
+Issues and specs for this repo live as cards on the claude-peers shared roadmap, scoped to this repository and shared by every session. Use the `mcp__kory-roadmap__roadmap_*` tools; GitHub Issues are not used.
 
 ## Conventions
 

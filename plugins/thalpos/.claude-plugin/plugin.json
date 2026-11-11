@@ -1,6 +1,6 @@
 {
   "name": "thalpos",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Keeps the prompt cache of the main conversation warm for a bounded period with cheap forked pings.",
   "author": {
     "name": "VOCSAP"
@@ -12,6 +12,12 @@
       "title": "Maximum hours",
       "description": "The longest period /keep-warm start accepts, in hours.",
       "default": 12
+    },
+    "autostart": {
+      "type": "boolean",
+      "title": "Allow automatic start",
+      "description": "Let the THALPOS_AUTOSTART variable start a keep-warm period by itself. Off: the variable is ignored.",
+      "default": false
     }
   }
 }

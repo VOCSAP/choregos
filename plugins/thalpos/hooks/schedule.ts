@@ -37,6 +37,22 @@ export function parseCommand(args: string, maxHours: number): Command {
   return hours >= MIN_HOURS && hours <= maxHours ? { action: 'start', hours } : { action: 'usage' }
 }
 
+export type Autostart = { action: 'none' } | { action: 'start'; hours: number } | { action: 'invalid'; reason: string }
+
+const AUTOSTART = /^(\d+(?:\.\d+)?)h?$/
+const DISABLED = new Set(['', '0', 'false', 'off', 'no'])
+
+// An unset, blank or disabling value starts nothing and says nothing, so a narrower settings.json can switch off a value set above it;
+export function parseAutostart(value: string | undefined, maxHours: number): Autostart {
+  const text = (value ?? '').trim().toLowerCase()
+  if (DISABLED.has(text)) return { action: 'none' }
+  if (text === '1' || text === 'true') return { action: 'start', hours: DEFAULT_HOURS }
+  const match = AUTOSTART.exec(text)
+  const hours = match === null ? Number.NaN : Number(match[1])
+  if (hours >= MIN_HOURS && hours <= maxHours) return { action: 'start', hours }
+  return { action: 'invalid', reason: `THALPOS_AUTOSTART must be true, 1, or a duration of ${MIN_HOURS} to ${maxHours} hours` }
+}
+
 export function isCold(now: number, lastRequestAt: number): boolean {
   return now >= lastRequestAt + COLD_AFTER_MS
 }
@@ -91,7 +107,8 @@ export function statusReport(state: ThalposWarm | undefined): string {
   if (state === undefined) return 'keep-warm: not active'
   const next = state.nextAt === null ? 'next ping after the next turn' : `next ping ${formatClock(state.nextAt)}`
   const pings = `${state.pings} ping${state.pings === 1 ? '' : 's'}`
-  return `keep-warm: active until ${formatClock(state.deadline)}, ${next}, ${pings}, cache_read_input_tokens ${state.cacheRead}, cache_creation_input_tokens ${state.cacheCreation}`
+  const kind = state.autoHours === undefined ? '' : ' (automatic)'
+  return `keep-warm: active${kind} until ${formatClock(state.deadline)}, ${next}, ${pings}, cache_read_input_tokens ${state.cacheRead}, cache_creation_input_tokens ${state.cacheCreation}`
 }
 
 const isCount = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value)
@@ -106,6 +123,7 @@ export function isWarm(value: unknown): value is ThalposWarm {
     isCount(state.pings) &&
     isCount(state.cacheRead) &&
     isCount(state.cacheCreation) &&
-    isCount(state.retries)
+    isCount(state.retries) &&
+    (state.autoHours === undefined || isCount(state.autoHours))
   )
 }

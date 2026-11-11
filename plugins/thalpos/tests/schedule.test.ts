@@ -9,6 +9,7 @@ import {
   isWarm,
   judgeReadback,
   maxHoursOption,
+  parseAutostart,
   parseCommand,
   pingDelay,
   planRetry,
@@ -52,6 +53,70 @@ describe('parseCommand', () => {
     expect(parseCommand('', 12)).toEqual({ action: 'usage' })
     expect(parseCommand('restart', 12)).toEqual({ action: 'usage' })
     expect(parseCommand('stop now', 12)).toEqual({ action: 'usage' })
+  })
+})
+
+describe('parseAutostart', () => {
+  test('an unset or blank value starts nothing', async () => {
+    expect(parseAutostart(undefined, 12)).toEqual({ action: 'none' })
+    expect(parseAutostart('', 12)).toEqual({ action: 'none' })
+    expect(parseAutostart('   ', 12)).toEqual({ action: 'none' })
+  })
+
+  test('0, false, off and no in any case switch automatic start off', async () => {
+    for (const value of ['0', 'false', 'off', 'no', ' OFF ', 'No', 'FALSE']) {
+      expect(parseAutostart(value, 12)).toEqual({ action: 'none' })
+    }
+    for (const value of ['of', 'nope', 'offf', '00', 'false1']) {
+      expect(parseAutostart(value, 12)).toMatchObject({ action: 'invalid' })
+    }
+  })
+
+  test('1 and true mean the default duration', async () => {
+    expect(parseAutostart('1', 12)).toEqual({ action: 'start', hours: 3 })
+    expect(parseAutostart('true', 12)).toEqual({ action: 'start', hours: 3 })
+    expect(parseAutostart(' TRUE ', 12)).toEqual({ action: 'start', hours: 3 })
+  })
+
+  test('a duration takes whole and fractional hours with or without the h suffix', async () => {
+    expect(parseAutostart('3', 12)).toEqual({ action: 'start', hours: 3 })
+    expect(parseAutostart('5h', 12)).toEqual({ action: 'start', hours: 5 })
+    expect(parseAutostart('1.5h', 12)).toEqual({ action: 'start', hours: 1.5 })
+    expect(parseAutostart('1.0', 12)).toEqual({ action: 'start', hours: 1 })
+  })
+
+  test('the bounds are one hour and the maximum, both included', async () => {
+    expect(parseAutostart('12', 12)).toEqual({ action: 'start', hours: 12 })
+    expect(parseAutostart('12.5', 12)).toMatchObject({ action: 'invalid' })
+    expect(parseAutostart('0.5', 12)).toMatchObject({ action: 'invalid' })
+    expect(parseAutostart('7', 6)).toMatchObject({ action: 'invalid' })
+    expect(parseAutostart('13', 24)).toEqual({ action: 'start', hours: 13 })
+  })
+
+  test('anything unreadable is invalid and names the variable and accepted range', async () => {
+    for (const value of ['soon', '-2', '5 6', '1e1', '.5']) {
+      expect(parseAutostart(value, 12)).toMatchObject({ action: 'invalid' })
+    }
+    expect(parseAutostart('soon', 12)).toEqual({
+      action: 'invalid',
+      reason: 'THALPOS_AUTOSTART must be true, 1, or a duration of 1 to 12 hours',
+    })
+  })
+
+  test('an invalid value with control and bidi characters is not copied into the reason', async () => {
+    const value = 'soon\n\x1b[31m‮hidden'
+    expect(parseAutostart(value, 12)).toEqual({
+      action: 'invalid',
+      reason: 'THALPOS_AUTOSTART must be true, 1, or a duration of 1 to 12 hours',
+    })
+  })
+
+  test('a long invalid value does not change the reason', async () => {
+    const verdict = parseAutostart('x'.repeat(500), 12)
+    expect(verdict).toEqual({
+      action: 'invalid',
+      reason: 'THALPOS_AUTOSTART must be true, 1, or a duration of 1 to 12 hours',
+    })
   })
 })
 
@@ -169,6 +234,12 @@ describe('statusReport and isWarm', () => {
     expect(statusReport({ ...warm, pings: 0 })).toContain('0 pings,')
   })
 
+  test('statusReport marks an automatic period and only that one', async () => {
+    expect(statusReport({ ...warm, autoHours: 3 })).toContain('active (automatic) until')
+    expect(statusReport(warm)).not.toContain('automatic')
+    expect(statusReport(warm)).toContain('active until')
+  })
+
   test('isWarm accepts a complete state and refuses anything else', async () => {
     expect(isWarm(warm)).toBe(true)
     expect(isWarm({ ...warm, nextAt: 5 })).toBe(true)
@@ -177,6 +248,12 @@ describe('statusReport and isWarm', () => {
     expect(isWarm({ ...warm, deadline: 'soon' })).toBe(false)
     expect(isWarm({ ...warm, nextAt: undefined })).toBe(false)
     expect(isWarm({ deadline: 1 })).toBe(false)
+  })
+
+  test('isWarm takes an absent or numeric autoHours and refuses any other', async () => {
+    expect(isWarm({ ...warm, autoHours: 3 })).toBe(true)
+    expect(isWarm({ ...warm, autoHours: 'soon' })).toBe(false)
+    expect(isWarm({ ...warm, autoHours: null })).toBe(false)
   })
 })
 

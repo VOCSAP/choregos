@@ -6,6 +6,7 @@ import { HOUR, MINUTE, PING_PROMPT, formatClock, statusLine } from '../hooks/sch
 
 const SUPPORTED: SessionVersion = { version: '2.1.303', base: '2.1.303' }
 const T0 = new Date(2026, 9, 26, 8, 0).getTime()
+const AUTO = { options: { autostart: true } }
 
 const usage = (read: number, wrote: number): ModelUsage => ({
   input_tokens: 5,
@@ -32,15 +33,21 @@ type World = {
   toasts: string[]
   logs: string[]
   commands: string[]
+  mainTurns: number
   state: unknown
   lastRequest: unknown
+  autoOff: unknown
   writes: unknown[]
   isStateDown: boolean
   /** While set, a fork stays in flight until the promise settles. */
   forkGate?: Promise<void>
+  warmClearGate?: Promise<void>
+  warmClearAttempts: number
+  warmNextNullGate?: Promise<void>
+  warmNextNullAttempts: number
 }
 
-function world(on: On, options: { version?: SessionVersion; state?: unknown } = {}): World {
+function world(on: On, options: { version?: SessionVersion; state?: unknown; env?: Record<string, string> } = {}): World {
   const clock = mock.clock(on, { now: T0 })
   const seen: World = {
     clock,
@@ -50,18 +57,33 @@ function world(on: On, options: { version?: SessionVersion; state?: unknown } = 
     toasts: [],
     logs: [],
     commands: [],
+    mainTurns: 0,
     state: options.state ?? null,
     lastRequest: null,
+    autoOff: null,
     writes: [],
     isStateDown: false,
+    warmClearAttempts: 0,
+    warmNextNullAttempts: 0,
   }
   on('state.get', (_$, e) => {
     if (seen.isStateDown) return { deny: 'state unavailable' }
-    return { value: { value: e.key === 'lastRequest' ? seen.lastRequest : seen.state, version: 1 } }
+    const slots: Record<string, unknown> = { lastRequest: seen.lastRequest, autoOff: seen.autoOff }
+    return { value: { value: e.key in slots ? slots[e.key] : seen.state, version: 1 } }
   })
-  on('state.set', (_$, e) => {
+  on('state.set', async (_$, e) => {
+    if (e.key === 'warm' && e.value === null && seen.warmClearGate !== undefined) {
+      seen.warmClearAttempts += 1
+      await seen.warmClearGate
+    }
+    if (e.key === 'warm' && e.value !== null && typeof e.value === 'object' && 'nextAt' in e.value && e.value.nextAt === null && seen.warmNextNullGate !== undefined) {
+      seen.warmNextNullAttempts += 1
+      await seen.warmNextNullGate
+    }
     if (e.key === 'lastRequest') {
       seen.lastRequest = e.value
+    } else if (e.key === 'autoOff') {
+      seen.autoOff = e.value
     } else {
       seen.state = e.value
       seen.writes.push(e.value)
@@ -90,8 +112,13 @@ function world(on: On, options: { version?: SessionVersion; state?: unknown } = 
     seen.logs.push(e.to)
     return { value: undefined }
   })
+  mock.env(on, options.env ?? {})
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
-  on('turn.complete', () => ({ text: 'stock' }))
+  on('session.end', (_$, e) => ({ sessionId: e.sessionId }))
+  on('turn.complete', () => {
+    seen.mainTurns += 1
+    return { text: 'stock' }
+  })
   on('command.run', () => ({ text: 'stock' }))
   return seen
 }
@@ -545,6 +572,22 @@ test('KW8 status gives the deadline, the next ping, the ping count and the summe
   expect(text).toContain('cache_creation_input_tokens 1200')
 })
 
+test('KW8 status says automatic for an automatic period, still gives the figures, and says nothing of it for a manual one', AUTO, async ($, on) => {
+  const seen = world(on, { env: { THALPOS_AUTOSTART: '5' } })
+  seen.replies.push(answered(100_000, 500))
+  await boot($)
+  await seen.clock.advance(minutes(60))
+
+  const automatic = await command($, 'status')
+  expect(automatic).toContain('(automatic)')
+  expect(automatic).toContain(formatClock(T0 + 5 * HOUR))
+  expect(automatic).toContain('1 ping,')
+  expect(automatic).toContain('cache_read_input_tokens 100000')
+
+  await command($, 'start 4')
+  expect(await command($, 'status')).not.toContain('automatic')
+})
+
 const SEED = {
   deadline: T0 + 2 * HOUR,
   lastRequestAt: T0 - minutes(10),
@@ -598,6 +641,430 @@ test('KW9 a second session.start does not stack a timer on the first', async ($,
   expect(forkMinutes(seen)).toEqual([50])
 })
 
+async function clearSession($: Engine, seen: World): Promise<void> {
+  // A /clear wipes the session's $.state and raises session.end, never session.start.
+  seen.state = null
+  seen.lastRequest = null
+  seen.autoOff = null
+  await $.session.end({ reason: 'clear', sessionId: 's', resume: { id: 's' } })
+}
+
+test('KW11 a valid THALPOS_AUTOSTART starts a period at session.start with no command', AUTO, async ($, on) => {
+  const seen = world(on, { env: { THALPOS_AUTOSTART: '5h' } })
+  await boot($)
+
+  expect(lastStatus(seen)).toBe(statusLine(T0 + minutes(50), T0 + 5 * HOUR))
+  await seen.clock.advance(minutes(50))
+  expect(forkMinutes(seen)).toEqual([50])
+})
+
+const AUTOSTART_DURATIONS: [string, number][] = [
+  ['3', 3],
+  ['1.5h', 1.5],
+  [' 5H ', 5],
+  ['1', 3],
+  ['true', 3],
+]
+
+for (const [value, hours] of AUTOSTART_DURATIONS) {
+  test(`KW11 THALPOS_AUTOSTART="${value}" runs for ${hours} hours`, AUTO, async ($, on) => {
+    const seen = world(on, { env: { THALPOS_AUTOSTART: value } })
+    await boot($)
+
+    expect(lastStatus(seen)).toBe(statusLine(T0 + minutes(50), T0 + hours * HOUR))
+  })
+}
+
+for (const value of ['soon', '0.5', '13', '-3', '5 6', 'maybe', 'of']) {
+  test(`KW11 THALPOS_AUTOSTART="${value}" starts nothing and says so with one toast`, AUTO, async ($, on) => {
+    const seen = world(on, { env: { THALPOS_AUTOSTART: value } })
+    await boot($)
+    await seen.clock.advance(6 * HOUR)
+
+    expect(seen.statuses).toEqual([])
+    expect(seen.forks).toEqual([])
+    expect(seen.state).toBeNull()
+    expect(seen.toasts).toHaveLength(1)
+    expect(seen.toasts[0]).toContain('THALPOS_AUTOSTART')
+    expect(seen.logs).toContain('debug')
+  })
+}
+
+for (const value of ['0', 'false', 'off', 'no', ' OFF ', 'No', 'FALSE']) {
+  test(`KW11 THALPOS_AUTOSTART="${value}" switches automatic start off and says nothing`, AUTO, async ($, on) => {
+    const seen = world(on, { env: { THALPOS_AUTOSTART: value } })
+    await boot($)
+    await mainTurn($)
+    await seen.clock.advance(6 * HOUR)
+
+    expect(seen.statuses).toEqual([])
+    expect(seen.forks).toEqual([])
+    expect(seen.state).toBeNull()
+    expect(seen.toasts).toEqual([])
+    expect(seen.logs).toEqual([])
+  })
+}
+
+test('KW11 a value above the max_hours option is refused', { options: { autostart: true, max_hours: 6 } }, async ($, on) => {
+  const seen = world(on, { env: { THALPOS_AUTOSTART: '7' } })
+  await boot($)
+
+  expect(seen.statuses).toEqual([])
+  expect(seen.toasts).toHaveLength(1)
+})
+
+test('KW11 an unset or blank THALPOS_AUTOSTART starts nothing and says nothing', AUTO, async ($, on) => {
+  const seen = world(on, { env: { THALPOS_AUTOSTART: '  ' } })
+  await boot($)
+  await mainTurn($)
+  await seen.clock.advance(6 * HOUR)
+
+  expect(seen.statuses).toEqual([])
+  expect(seen.toasts).toEqual([])
+  expect(seen.state).toBeNull()
+})
+
+test('KW11 a second session.start during an automatic period keeps its deadline and stacks no timer', AUTO, async ($, on) => {
+  const seen = world(on, { env: { THALPOS_AUTOSTART: '3' } })
+  await boot($)
+  await seen.clock.advance(minutes(20))
+  await boot($)
+
+  expect(lastStatus(seen)).toBe(statusLine(T0 + minutes(50), T0 + 3 * HOUR))
+  await seen.clock.advance(minutes(60))
+  expect(forkMinutes(seen)).toEqual([50])
+})
+
+test('KW11 an unsupported release starts nothing even with THALPOS_AUTOSTART set', AUTO, async ($, on) => {
+  const seen = world(on, { version: { version: '2.1.302', base: '2.1.302' }, env: { THALPOS_AUTOSTART: '3' } })
+  await boot($)
+
+  expect(seen.statuses).toEqual([])
+  expect(seen.toasts).toEqual([])
+})
+
+test('KW12 in automatic mode each main turn moves the deadline to now plus the duration', AUTO, async ($, on) => {
+  const seen = world(on, { env: { THALPOS_AUTOSTART: '2' } })
+  await boot($)
+  await seen.clock.advance(minutes(30))
+  await mainTurn($)
+
+  expect(lastStatus(seen)).toBe(statusLine(T0 + minutes(80), T0 + minutes(30) + 2 * HOUR))
+})
+
+test('KW12 a completed old deadline cannot erase a period rearmed by a concurrent main turn', AUTO, async ($, on) => {
+  const seen = world(on, { env: { THALPOS_AUTOSTART: '1h' } })
+  let releaseClear = () => {}
+  seen.warmClearGate = new Promise<void>(resolve => { releaseClear = resolve })
+  await boot($)
+
+  await seen.clock.advance(HOUR)
+  await seen.clock.advance(0)
+  expect(seen.warmClearAttempts).toBe(1)
+  const turn = mainTurn($)
+  await seen.clock.advance(0)
+  expect(seen.mainTurns).toBe(1)
+
+  seen.warmClearGate = undefined
+  releaseClear()
+  await turn
+  await seen.clock.advance(0)
+
+  expect(lastStatus(seen)).toBe(statusLine(T0 + HOUR + minutes(50), T0 + 2 * HOUR))
+})
+
+test('KW12 a ping cannot restore a deadline superseded before the ping was marked in flight', AUTO, async ($, on) => {
+  const seen = world(on, { env: { THALPOS_AUTOSTART: '3' } })
+  let releaseWrite = () => {}
+  let releaseFork = () => {}
+  seen.warmNextNullGate = new Promise<void>(resolve => { releaseWrite = resolve })
+  seen.forkGate = new Promise<void>(resolve => { releaseFork = resolve })
+  await boot($)
+
+  await seen.clock.advance(minutes(50))
+  expect(seen.warmNextNullAttempts).toBe(1)
+  const turn = mainTurn($)
+  await seen.clock.advance(0)
+  expect(seen.mainTurns).toBe(1)
+
+  seen.warmNextNullGate = undefined
+  releaseWrite()
+  await turn
+  await seen.clock.advance(0)
+  expect(forkMinutes(seen)).toEqual([50])
+  seen.forkGate = undefined
+  releaseFork()
+  await seen.clock.advance(0)
+
+  expect(lastStatus(seen)).toBe(statusLine(T0 + minutes(100), T0 + minutes(50) + 3 * HOUR))
+})
+
+test('KW12 an automatic period outlives its first duration while turns keep coming, then ends after the last one', AUTO, async ($, on) => {
+  const seen = world(on, { env: { THALPOS_AUTOSTART: '2' } })
+  await boot($)
+  for (let turn = 0; turn < 7; turn++) {
+    await seen.clock.advance(minutes(40))
+    await mainTurn($)
+  }
+  expect(seen.toasts).toEqual([])
+  expect(seen.forks).toEqual([])
+
+  await seen.clock.advance(3 * HOUR)
+
+  expect(forkMinutes(seen)).toEqual([330, 380])
+  expect(seen.toasts).toHaveLength(1)
+  expect(lastStatus(seen)).toBeUndefined()
+  expect(seen.state).toBeNull()
+})
+
+test('KW12 a ping does not move the deadline of an automatic period', AUTO, async ($, on) => {
+  const seen = world(on, { env: { THALPOS_AUTOSTART: '3' } })
+  await boot($)
+  await seen.clock.advance(minutes(60))
+
+  expect(forkMinutes(seen)).toEqual([50])
+  expect(lastStatus(seen)).toBe(statusLine(T0 + minutes(100), T0 + 3 * HOUR))
+})
+
+test('KW12 a manual start over an automatic period fixes the deadline again', AUTO, async ($, on) => {
+  const seen = world(on, { env: { THALPOS_AUTOSTART: '2' } })
+  await boot($)
+  await command($, 'start 4')
+  await seen.clock.advance(minutes(30))
+  await mainTurn($)
+
+  expect(lastStatus(seen)).toBe(statusLine(T0 + minutes(80), T0 + 4 * HOUR))
+})
+
+test('KW13 stop keeps automatic start off for the rest of the session', AUTO, async ($, on) => {
+  const seen = world(on, { env: { THALPOS_AUTOSTART: '3' } })
+  await boot($)
+  await command($, 'stop')
+  const before = seen.statuses.length
+
+  await boot($)
+  await mainTurn($)
+  await seen.clock.advance(6 * HOUR)
+
+  expect(seen.statuses.length).toBe(before)
+  expect(seen.forks).toEqual([])
+  expect(seen.state).toBeNull()
+})
+
+test('KW13 stop with no active period also keeps automatic start off', AUTO, async ($, on) => {
+  const seen = world(on, { env: { THALPOS_AUTOSTART: '1.5' } })
+  await boot($)
+  await seen.clock.advance(2 * HOUR)
+  expect(await command($, 'stop')).toContain('nothing was active')
+  const before = seen.statuses.length
+
+  await boot($)
+
+  expect(seen.statuses.length).toBe(before)
+})
+
+test('KW13 a manual start after stop keeps the fixed deadline', AUTO, async ($, on) => {
+  const seen = world(on, { env: { THALPOS_AUTOSTART: '2' } })
+  await boot($)
+  await command($, 'stop')
+  await command($, 'start 4')
+  await seen.clock.advance(minutes(30))
+  await mainTurn($)
+
+  expect(lastStatus(seen)).toBe(statusLine(T0 + minutes(80), T0 + 4 * HOUR))
+})
+
+test('KW14 the first main turn after a /clear starts the automatic period', AUTO, async ($, on) => {
+  const seen = world(on, { env: { THALPOS_AUTOSTART: '2' } })
+  await boot($)
+  await seen.clock.advance(minutes(30))
+  await clearSession($, seen)
+  await mainTurn($)
+
+  expect(lastStatus(seen)).toBe(statusLine(T0 + minutes(80), T0 + minutes(30) + 2 * HOUR))
+  await seen.clock.advance(minutes(50))
+  expect(forkMinutes(seen)).toEqual([80])
+})
+
+test('KW14 a /clear ends the session, so automatic start is back on after a stop', AUTO, async ($, on) => {
+  const seen = world(on, { env: { THALPOS_AUTOSTART: '2' } })
+  await boot($)
+  await command($, 'stop')
+  await clearSession($, seen)
+  await mainTurn($)
+
+  expect(lastStatus(seen)).toBe(statusLine(T0 + minutes(50), T0 + 2 * HOUR))
+})
+
+test('KW14 a main turn after the natural end of an automatic period starts a new one and the end toast stays', AUTO, async ($, on) => {
+  const seen = world(on, { env: { THALPOS_AUTOSTART: '1.5' } })
+  await boot($)
+  await seen.clock.advance(2 * HOUR)
+  expect(seen.toasts).toHaveLength(1)
+  expect(lastStatus(seen)).toBeUndefined()
+
+  await mainTurn($)
+
+  expect(lastStatus(seen)).toBe(statusLine(T0 + 2 * HOUR + minutes(50), T0 + 2 * HOUR + 1.5 * HOUR))
+  await seen.clock.advance(3 * HOUR)
+  expect(forkMinutes(seen)).toEqual([50, 170])
+  expect(seen.toasts).toHaveLength(2)
+})
+
+test('KW14 a stop keeps the next main turn from starting a period', AUTO, async ($, on) => {
+  const seen = world(on, { env: { THALPOS_AUTOSTART: '1.5' } })
+  await boot($)
+  await seen.clock.advance(2 * HOUR)
+  await command($, 'stop')
+  const before = seen.statuses.length
+
+  await mainTurn($)
+  await seen.clock.advance(3 * HOUR)
+
+  expect(seen.statuses.length).toBe(before)
+  expect(forkMinutes(seen)).toEqual([50])
+})
+
+for (const [name, reply] of [
+  ['a non-transient API failure', apiError(400)],
+  ['a dropped connection', apiError(null)],
+] as [string, ModelForkResult][]) {
+  test(`KW14 a period stopped by ${name} restarts at the next main turn`, AUTO, async ($, on) => {
+    const seen = world(on, { env: { THALPOS_AUTOSTART: '5' } })
+    seen.replies.push(reply)
+    await boot($)
+    await seen.clock.advance(minutes(60))
+    expect(seen.toasts).toHaveLength(1)
+    expect(seen.toasts[0]).not.toContain('automatic start is off')
+    expect(lastStatus(seen)).toBeUndefined()
+
+    await mainTurn($)
+
+    expect(lastStatus(seen)).toBe(statusLine(T0 + minutes(110), T0 + minutes(60) + 5 * HOUR))
+  })
+}
+
+for (const [name, reply] of [
+  ['a read of nothing', answered(0, 150_000)],
+  ['a write of a tenth of the read', answered(1000, 100)],
+] as [string, ModelForkResult][]) {
+  test(`KW13 ${name} that stops an automatic period turns automatic start off and the toast says so`, AUTO, async ($, on) => {
+    const seen = world(on, { env: { THALPOS_AUTOSTART: '5' } })
+    seen.replies.push(reply)
+    await boot($)
+    await seen.clock.advance(minutes(60))
+
+    expect(seen.toasts).toHaveLength(1)
+    expect(seen.toasts[0]).toContain('automatic start is off until /clear or restart')
+    expect(lastStatus(seen)).toBeUndefined()
+
+    const before = seen.statuses.length
+    await mainTurn($)
+    await seen.clock.advance(3 * HOUR)
+    expect(seen.statuses.length).toBe(before)
+    expect(forkMinutes(seen)).toEqual([50])
+
+    await clearSession($, seen)
+    await mainTurn($)
+    expect(lastStatus(seen)).toBe(statusLine(T0 + 3 * HOUR + minutes(110), T0 + 3 * HOUR + minutes(60) + 5 * HOUR))
+  })
+}
+
+test('KW13 a cold readback that stops a manual period leaves automatic start alone', AUTO, async ($, on) => {
+  const seen = world(on, { env: { THALPOS_AUTOSTART: '5' } })
+  seen.replies.push(answered(0, 150_000))
+  await boot($)
+  await command($, 'start 4')
+  await seen.clock.advance(minutes(60))
+
+  expect(seen.toasts).toHaveLength(1)
+  expect(seen.toasts[0]).toContain('read 0')
+  expect(seen.toasts[0]).not.toContain('automatic start is off')
+
+  await mainTurn($)
+
+  expect(lastStatus(seen)).toBe(statusLine(T0 + minutes(110), T0 + minutes(60) + 5 * HOUR))
+})
+
+test('KW14 a main turn with no period held and no variable starts nothing', async ($, on) => {
+  const seen = world(on)
+  await boot($)
+  await mainTurn($)
+  await seen.clock.advance(minutes(60))
+  await mainTurn($)
+
+  expect(seen.statuses).toEqual([])
+  expect(seen.toasts).toEqual([])
+})
+
+test('KW14 an invalid value is toasted at session.start, then only logged at each main turn', AUTO, async ($, on) => {
+  const seen = world(on, { env: { THALPOS_AUTOSTART: 'soon' } })
+  await boot($)
+  await mainTurn($)
+  await mainTurn($)
+
+  expect(seen.toasts).toHaveLength(1)
+  expect(seen.logs).toEqual(['debug', 'debug', 'debug'])
+  expect(seen.statuses).toEqual([])
+})
+
+for (const value of ['3', 'true', 'soon', '13']) {
+  test(`KW15 THALPOS_AUTOSTART="${value}" starts nothing while the autostart option is off and only logs once`, async ($, on) => {
+    const seen = world(on, { env: { THALPOS_AUTOSTART: value } })
+    await boot($)
+    await mainTurn($)
+    await seen.clock.advance(6 * HOUR)
+    await mainTurn($)
+
+    expect(seen.statuses).toEqual([])
+    expect(seen.forks).toEqual([])
+    expect(seen.state).toBeNull()
+    expect(seen.toasts).toEqual([])
+    expect(seen.logs).toEqual(['debug'])
+  })
+}
+
+test('KW15 an explicit autostart option of false behaves as the default', { options: { autostart: false } }, async ($, on) => {
+  const seen = world(on, { env: { THALPOS_AUTOSTART: '3' } })
+  await boot($)
+
+  expect(seen.statuses).toEqual([])
+  expect(seen.logs).toEqual(['debug'])
+})
+
+test('KW15 with the option off a main turn after a /clear starts nothing', async ($, on) => {
+  const seen = world(on, { env: { THALPOS_AUTOSTART: '3' } })
+  await boot($)
+  await clearSession($, seen)
+  await mainTurn($)
+
+  expect(seen.statuses).toEqual([])
+  expect(seen.state).toBeNull()
+})
+
+for (const value of ['0', 'off', '']) {
+  test(`KW15 with the option off THALPOS_AUTOSTART="${value}" logs nothing`, async ($, on) => {
+    const seen = world(on, { env: { THALPOS_AUTOSTART: value } })
+    await boot($)
+    await mainTurn($)
+
+    expect(seen.logs).toEqual([])
+    expect(seen.toasts).toEqual([])
+  })
+}
+
+test('KW15 with the option off the manual commands still work', async ($, on) => {
+  const seen = world(on, { env: { THALPOS_AUTOSTART: '3' } })
+  await boot($)
+
+  expect(await command($, 'start 2')).toContain('started')
+  expect(lastStatus(seen)).toBe(statusLine(T0 + minutes(50), T0 + 2 * HOUR))
+  await seen.clock.advance(minutes(60))
+  expect(forkMinutes(seen)).toEqual([50])
+  expect(await command($, 'status')).not.toContain('automatic')
+  expect(await command($, 'stop')).toContain('stopped')
+})
+
 test('KW10 the plugin reaches the engine only through the capabilities it declares', async ($, on) => {
   const operations = new Set<string>()
   on('*', (_$, e, next) => {
@@ -623,6 +1090,7 @@ test('KW10 the plugin reaches the engine only through the capabilities it declar
       'clock.after',
       'clock.now',
       'command.register',
+      'env.get',
       'model.fork',
       'session.version',
       'state.get',

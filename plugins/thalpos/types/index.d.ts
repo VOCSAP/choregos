@@ -10,11 +10,13 @@ export type ThalposWarm = {
   cacheCreation: number
   /** Retries already spent on the ping in progress. */
   retries: number
+  /** Hours the period runs past the latest main turn; set only by automatic start, so each turn moves the deadline. */
+  autoHours?: number
 }
 
 declare module 'claude-code' {
   interface PluginState {
-    /** `lastRequest`: epoch ms of the latest main turn.complete or warm ping, kept while inactive so start counts from it. */
-    thalpos: { warm: ThalposWarm | null; lastRequest: number | null }
+    /** `lastRequest`: epoch ms of the latest main turn.complete or warm ping, kept while inactive so start counts from it. `autoOff`: true once /keep-warm stop ran, or a cold-readback ping stopped an automatic period, so automatic start stays off until the session ends. */
+    thalpos: { warm: ThalposWarm | null; lastRequest: number | null; autoOff: boolean | null }
   }
 }
